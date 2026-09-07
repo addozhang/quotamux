@@ -85,7 +85,9 @@ The API and Routing workspace are available at <http://127.0.0.1:8080>. Compose
 mounts the private `data/routing` directory for validated configuration saves and
 stores the request ledger in a named volume. The initial page is All Statistics
 for 1 day; selecting a model also opens its Statistics for 1 day. Accounts is a
-separate page sharing the workspace draft. Click Enable edit to change settings.
+separate page with one tab per account, plus Shared capacity and Runtime settings.
+It shows read-only information until Enable edit reveals the selected tab's
+editors; all tabs share the workspace draft.
 Each deletion requires confirmation before changing the draft. Save asks for
 confirmation of all pending updates, validates changed upstream bindings,
 persists readable TOML and immediately activates new requests. Existing requests
@@ -277,13 +279,13 @@ their adapters and backends must remain separate. See the
 [Kimi Code API overview](https://www.kimi.com/code/docs/) and
 [Kimi Platform API overview](https://platform.kimi.com/docs/api/overview).
 
-Zhipu Coding Plan uses separate official roots for OpenAI Chat, OpenAI
+GLM Coding Plan uses separate official roots for OpenAI Chat, OpenAI
 Responses, and Anthropic Messages. Declare all three native protocols on the
 backend model so Responses requests use Zhipu's `/api/v1/responses` endpoint
 without translation.
 Zhipu `glm-5.3-flash` and OpenCode Go `glm-5.3-flash` both have 1M-token
 multimodal context windows; do not substitute the text-only `glm-5.3` model.
-See the [Zhipu Coding Plan endpoint guide](https://docs.bigmodel.cn/cn/coding-plan/quick-start),
+See the [GLM Coding Plan endpoint guide](https://docs.bigmodel.cn/cn/coding-plan/quick-start),
 the [official GLM-5.3-Flash announcement](https://z.ai/blog/glm-5.3-flash), and
 the [OpenCode GLM-5.3-Flash model data](https://opencode.ai/data/zhipu/glm-5-3-flash).
 
@@ -453,7 +455,7 @@ Adapters classify failures by provider meaning, not by status code alone:
   opening the shared target circuit.
 - Kimi Official uses the structured Kimi Platform `error.type` values described
   in the [platform error reference](https://platform.kimi.com/docs/api/errors).
-- Zhipu Coding Plan uses the official numeric business codes to distinguish
+- GLM Coding Plan uses the official numeric business codes to distinguish
   request errors, rate pressure, subscription quota, billing, and account or
   model configuration failures.
 - Custom adapters use generic HTTP classification only.

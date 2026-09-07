@@ -403,3 +403,19 @@ tbody tr:hover > * { background: #19202a; }
 .child-nav [aria-pressed="true"] { color: var(--text); border-bottom-color: var(--accent); }
 
 .header-actions [aria-current="page"] { color: var(--accent); border-color: var(--accent); }
+
+.account-tabs {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 12px;
+  margin-bottom: 22px;
+  border-bottom: 1px solid var(--line);
+}
+.account-tabs button { flex: 0 0 auto; }
+.account-tabs [aria-selected="true"] { color: var(--accent); border-color: var(--accent); }
+.info-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr)); gap: 16px 24px; }
+.info-grid dt { color: var(--muted); font-size: 12px; }
+.info-grid dd { margin: 4px 0 0; overflow-wrap: anywhere; }
+.accounts-page h2, .accounts-page h3, .accounts-page p { overflow-wrap: anywhere; }
+.accounts-page .table-scroll { margin-top: 12px; }

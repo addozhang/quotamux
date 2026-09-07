@@ -26,7 +26,7 @@ consumption. DeepSeek official rates estimate pay-as-you-go usage. None of these
 estimates replaces the provider's account statement. The sources above support
 these billing distinctions.
 
-Zhipu Coding Plan publishes points for GLM-5.3-Flash: weekday 14:00–18:00 in
+GLM Coding Plan publishes points for GLM-5.3-Flash: weekday 14:00–18:00 in
 UTC+8 uses `(uncached × 2.3 + cached × 0.56 + output × 8) / 10000`;
 other times use half. Keep its USD pricing absent and retain that rule in
 Accounts notes. [Zhipu plan documentation](https://docs.bigmodel.cn/cn/coding-plan/overview).

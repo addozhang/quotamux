@@ -7,6 +7,9 @@ const esc = (v) =>
         c
       ],
   );
+// Product labels do not change saved identities or historical attribution.
+const displayName = (value) => value === "zhipu-coding-plan" ? "GLM Coding Plan" : value;
+const optionName = (path, value) => /\.(adapter|backend)$|\.order\.\d+$/.test(path) ? displayName(value) : value;
 const state = {
   live: null,
   draft: null,
@@ -14,6 +17,7 @@ const state = {
   selected: "all",
   view: "statistics",
   accounts: false,
+  accountTab: null,
   editing: false,
   dirty: false,
   busy: false,
@@ -36,6 +40,7 @@ const browseActions = new Set([
   "enable-edit",
   "disable-edit",
   "accounts",
+  "account-tab",
   "workspace",
   "select",
   "view",
@@ -69,7 +74,7 @@ const button = (action, label, path = "", extra = "") =>
   `<button type="button" data-action="${action}" data-path="${esc(path)}" ${extra}>${esc(label)}</button>`;
 function field(path, label, kind = "text", choices = null) {
   const value = get(path);
-  return `<label><span>${esc(label)}</span>${choices ? `<select data-field="${path}">${[...new Set([...(value ? [value] : []), ...choices])].map((v) => `<option value="${esc(v)}" ${value === v ? "selected" : ""}>${esc(v || "None")}</option>`).join("")}</select>` : `<input data-field="${path}" data-kind="${kind}" type="${kind === "number" ? "number" : kind === "password" ? "password" : "text"}" ${kind === "number" ? 'min="0" step="any"' : ""} value="${esc(kind === "list" ? (value || []).join(", ") : value)}" autocomplete="${kind === "password" ? "new-password" : "off"}">`}</label>`;
+  return `<label><span>${esc(label)}</span>${choices ? `<select data-field="${path}">${[...new Set([...(value ? [value] : []), ...choices])].map((v) => `<option value="${esc(v)}" ${value === v ? "selected" : ""}>${esc(optionName(path, v) || "None")}</option>`).join("")}</select>` : `<input data-field="${path}" data-kind="${kind}" type="${kind === "number" ? "number" : kind === "password" ? "password" : "text"}" ${kind === "number" ? 'min="0" step="any"' : ""} value="${esc(kind === "list" ? (value || []).join(", ") : value)}" autocomplete="${kind === "password" ? "new-password" : "off"}">`}</label>`;
 }
 function choices(path, label, values) {
   return `<fieldset class="choices"><legend>${esc(label)}</legend>${values.map(([v, title]) => `<label><input type="checkbox" data-choice="${path}" value="${v}" ${(get(path) || []).includes(v) ? "checked" : ""}>${esc(title)}</label>`).join("")}</fieldset>`;
@@ -138,11 +143,22 @@ function modelEditor(m) {
       "",
     )}<div class="preview"><h3>Preview saved policy</h3><p class="muted">Read-only preview uses the currently saved rules, not unsaved edits.</p><label><span>Instant (RFC3339 with timezone)</span><input id="preview-at" value="${esc(state.at)}" placeholder="2026-09-07T12:00:00Z"></label>${button("preview", "Preview saved order")}<div id="preview-result">${state.preview ? esc(state.preview) : ""}</div></div></section>`;
 }
+function normalizeAccountTab() {
+  if (state.accountTab === "pools" || state.accountTab === "runtime") return;
+  const index = Number(state.accountTab?.split(":")[1]);
+  if (state.accountTab?.startsWith("backend:") && state.draft.backends[index]) return;
+  state.accountTab = state.draft.backends.length ? "backend:0" : "pools";
+}
 function accounts() {
-  return `<main class="accounts-page" aria-label="Accounts"><div class="heading"><h1>Accounts and shared capacity</h1></div><p class="muted">Credentials stay blank when loaded. Leave an existing key blank to preserve it.</p>${state.draft.backends
-    .map((b, i) => {
+  normalizeAccountTab();
+  const tabs = [...state.draft.backends.map((backend, index) => [`backend:${index}`, displayName(backend.id || "New account")]), ["pools", "Shared capacity"], ["runtime", "Runtime settings"]];
+  const index = Number(state.accountTab.split(":")[1]);
+  const panel = state.accountTab === "pools" ? capacityPanel() : state.accountTab === "runtime" ? advanced() : state.editing ? accountEditor(state.draft.backends[index], index) : accountSummary(state.draft.backends[index]);
+  return `<main class="accounts-page" aria-label="Accounts"><div class="heading"><h1>Accounts</h1>${state.editing ? button("add-backend", "+ Add account") : ""}</div><nav class="account-tabs" role="tablist" aria-label="Account settings">${tabs.map(([id, label]) => button("account-tab", label, id, `role="tab" id="account-tab-${id}" aria-controls="account-panel" aria-selected="${state.accountTab === id}"`)).join("")}</nav><div role="tabpanel" id="account-panel" aria-labelledby="account-tab-${state.accountTab}">${panel}</div></main>`;
+}
+function accountEditor(b, i) {
       const p = `backends.${i}`;
-      return `<article><h3>${esc(b.id || "New account")}</h3><div class="row">${field(p + ".id", "Account ID")}${field(p + ".adapter", "Adapter", "text", adapters)}</div>${b.adapter.startsWith("custom-") ? field(p + ".endpoint", "Endpoint URL (blank preserves existing)") : '<p class="muted">Official endpoint managed by adapter</p>'}<h4>Credentials</h4>${b.credentials
+      return `<p class="muted">Credentials stay blank when loaded. Leave an existing key blank to preserve it.</p><article><h3 data-account-heading>${esc(displayName(b.id || "New account"))}</h3><div class="row">${field(p + ".id", "Account ID")}${field(p + ".adapter", "Adapter", "text", adapters)}</div>${b.adapter.startsWith("custom-") ? field(p + ".endpoint", "Endpoint URL (blank preserves existing)") : '<p class="muted">Official endpoint managed by adapter</p>'}<h4>Credentials</h4>${b.credentials
         .map((c, j) => {
           const q = `${p}.credentials.${j}`;
           return `<div class="credential"><div class="row">${field(q + ".id", "Credential ID")}${field(q + ".api_key", "API key (blank preserves existing)", "password")}${field(q + ".pool", "Shared pool", "text", ["", ...(state.draft.capacity_pools || []).map((p) => p.id)])}</div>${button("remove", "Delete credential", q)}</div>`;
@@ -161,10 +177,26 @@ function accounts() {
         .join(
           "",
         )}${button("add-upstream", "+ Add upstream model", p + ".models")}${button("remove", "Delete account", p)}</article>`;
-    })
-    .join(
-      "",
-    )}${button("add-backend", "+ Add account")}<h3>Shared capacity pools</h3><p class="muted">Assign credentials above. No pool means no local concurrency limit.</p>${(state.draft.capacity_pools || []).map((p, i) => `<article><div class="row">${field(`capacity_pools.${i}.id`, "Pool ID")}${field(`capacity_pools.${i}.max_in_flight`, "Maximum concurrent requests", "number")}${button("remove", "Delete pool", `capacity_pools.${i}`)}</div></article>`).join("")}${button("add-pool", "+ Add pool")}${advanced()}</main>`;
+}
+function infoRows(rows) {
+  return `<dl class="info-grid">${rows.map(([label, value]) => `<div><dt>${esc(label)}</dt><dd>${esc(value ?? "—")}</dd></div>`).join("")}</dl>`;
+}
+function poolText(id) {
+  if (!id) return "No local limit";
+  const pool = state.live?.pools?.find(row => row.id === id);
+  return pool ? `${id} · ${pool.in_flight} / ${pool.max_in_flight} in flight` : `${id} · No live occupancy available`;
+}
+function rateSummary(rates) {
+  return rates ? `Cached input ${rates.cache_hit_input_usd_per_million}; uncached input ${rates.cache_miss_input_usd_per_million}; output ${rates.output_usd_per_million} USD / million tokens` : "No published usage rates configured";
+}
+function accountSummary(backend) {
+  const dayNames = ["", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+  return `<article><h2>${esc(displayName(backend.id))}</h2>${infoRows([["Adapter", displayName(backend.adapter)], ["Endpoint", backend.adapter.startsWith("custom-") ? backend.endpoint || "Saved endpoint is redacted" : "Official endpoint managed by adapter"]])}<h3>Credentials</h3>${backend.credentials.length ? `<div class="table-scroll"><table><thead><tr><th>Credential</th><th>Shared capacity</th></tr></thead><tbody>${backend.credentials.map(credential => `<tr><td>${esc(credential.id)}</td><td data-pool-status="${esc(credential.pool || "")}" ${credential.pool ? `data-live-pool="${esc(credential.pool)}"` : ""}>${esc(poolText(credential.pool))}</td></tr>`).join("")}</tbody></table></div>` : '<p class="muted">No credentials configured.</p>'}</article><h2>Upstream models</h2>${backend.models.map(model => `<article><h3>${esc(model.name)}</h3>${infoRows([["Supported protocols", model.protocols?.length ? model.protocols.join(", ") : "Adapter defaults"], ["Billing context", model.pricing_note || "Not configured"], ["Rate reference", model.pricing_source || "Not configured"], ["Default rates", rateSummary(model.pricing)]])}<h4>Active rates</h4><p data-price-backend="${esc(backend.id)}" data-price-model="${esc(model.name)}">${esc(activePriceText(state.live?.pricing?.find(row => row.backend === backend.id && row.model === model.name)))}</p><p class="muted">Usage value is an estimate, not an actual cash bill. Subscription requests may consume quota.</p>${model.pricing_schedule ? `<h4>Weekly price windows · ${esc(model.pricing_schedule.timezone)}</h4><div class="table-scroll"><table><thead><tr><th>Window</th><th>Starting days</th><th>Start</th><th>End</th><th>Rates (USD / million tokens)</th></tr></thead><tbody>${model.pricing_schedule.windows.map(window => `<tr><td>${esc(window.name)}</td><td>${esc(window.days.map(day => dayNames[day] || day).join(", "))}</td><td>${esc(window.start)}</td><td>${esc(window.end)}</td><td>${esc(rateSummary(window.pricing))}</td></tr>`).join("")}</tbody></table></div>` : ""}</article>`).join("") || '<p class="muted">No upstream models configured.</p>'}`;
+}
+function capacityPanel() {
+  const pools = state.draft.capacity_pools || [];
+  if (!state.editing) return `<h2>Shared capacity</h2>${pools.length ? `<div class="table-scroll"><table><thead><tr><th>Pool</th><th>In flight / maximum</th><th>Configured maximum concurrent requests</th></tr></thead><tbody>${pools.map(pool => `<tr><td>${esc(pool.id)}</td><td data-pool-count="${esc(pool.id)}" data-live-pool="${esc(pool.id)}">${esc(poolText(pool.id))}</td><td>${esc(pool.max_in_flight)}</td></tr>`).join("")}</tbody></table></div>` : '<p class="muted">No shared capacity pools configured.</p>'}`;
+  return `<h2>Shared capacity</h2><p class="muted">Assign pools to credentials in each account. No pool means no local concurrency limit.</p>${pools.map((pool, i) => `<article><div class="row">${field(`capacity_pools.${i}.id`, "Pool ID")}${field(`capacity_pools.${i}.max_in_flight`, "Maximum concurrent requests", "number")}${button("remove", "Delete pool", `capacity_pools.${i}`)}</div></article>`).join("")}${button("add-pool", "+ Add pool")}`;
 }
 const windows = [
   ["1h", "1 hour"],
@@ -220,11 +252,9 @@ function advanced() {
     "affinity.max_leases": "Maximum affinity leases",
     "affinity.success_ttl_ms": "Successful affinity lifetime (ms)",
   };
-  return `<details><summary>Advanced runtime settings</summary><p class="muted">These settings apply on Save. Listener and data location require a restart.</p><div class="row"><label>Listener<input readonly value="${esc(state.draft.server.listen)}"></label><label>Data directory<input readonly value="${esc(state.draft.server.data_dir)}"></label></div><div class="row">${Object.entries(
-    tuning,
-  )
-    .map(([path, label]) => field(path, label, "number"))
-    .join("")}</div></details>`;
+  const location = infoRows([["Listener", state.draft.server.listen], ["Data directory", state.draft.server.data_dir]]);
+  if (!state.editing) return `<h2>Runtime settings</h2>${location}${infoRows(Object.entries(tuning).map(([path, label]) => [label, get(path)]))}`;
+  return `<h2>Runtime settings</h2><p class="muted">These settings apply on Save. Listener and data location require a restart.</p>${location}<div class="row">${Object.entries(tuning).map(([path, label]) => field(path, label, "number")).join("")}</div>`;
 }
 function childView() {
   const model = state.draft.models[state.selected];
@@ -237,13 +267,13 @@ function childView() {
   if (state.view === "statistics" && state.selected === "all")
     return globalStatistics();
   if (state.view === "history") {
-    return `<h1>Recent request history</h1><div class="buttons">${button("newer", "Newer", "", state.cursors.length ? "" : "disabled")}<span>Page ${state.cursors.length + 1}</span>${button("older", "Older", "", state.nextCursor ? "" : "disabled")}</div><div class="table-scroll"><table><thead><tr><th>Started</th><th>Model</th><th>Layer</th><th>Account / key</th><th>Status</th><th>Tokens</th></tr></thead><tbody>${(state.history?.requests || []).map((r) => `<tr><td>${esc(new Date(r.started_at_ms).toLocaleString())}</td><td>${esc(r.served_model)}</td><td>${esc(r.route_layer)}</td><td>${esc(r.backend)} / ${esc(r.credential)}</td><td>${esc(r.status)}</td><td>${esc(r.usage?.total_tokens || 0)}</td></tr>`).join("")}</tbody></table></div>`;
+    return `<h1>Recent request history</h1><div class="buttons">${button("newer", "Newer", "", state.cursors.length ? "" : "disabled")}<span>Page ${state.cursors.length + 1}</span>${button("older", "Older", "", state.nextCursor ? "" : "disabled")}</div><div class="table-scroll"><table><thead><tr><th>Started</th><th>Model</th><th>Layer</th><th>Account / key</th><th>Status</th><th>Tokens</th></tr></thead><tbody>${(state.history?.requests || []).map((r) => `<tr><td>${esc(new Date(r.started_at_ms).toLocaleString())}</td><td>${esc(r.served_model)}</td><td>${esc(displayName(r.route_layer))}</td><td>${esc(displayName(r.backend))} / ${esc(r.credential)}</td><td>${esc(r.status)}</td><td>${esc(r.usage?.total_tokens || 0)}</td></tr>`).join("")}</tbody></table></div>`;
   }
   const value = (totals) =>
     Number(totals?.[state.metric] || 0).toLocaleString();
   const targetRow = (target, layer, historical = false) =>
-    `<tr><td>${historical ? "Historical target" : "Target"}</td><td>${esc(layer)}</td><td>${esc(target.backend)}</td><td>${esc(target.credential)}</td><td>${esc(target.upstream_model || target.model)}</td><td>${value(target.totals)}</td></tr>`;
-  return `<h1>Model statistics</h1><div class="buttons">${windows.map(([id, label]) => button("window", label, id, `aria-pressed="${id === state.window}"`)).join("")}</div><div class="buttons">${metrics.map(([id, label]) => button("metric", label, id, `aria-pressed="${id === state.metric}"`)).join("")}</div><p>Model total: ${value(state.stats?.totals)}</p><div class="table-scroll"><table><thead><tr><th>Entry</th><th>Layer</th><th>Account</th><th>Key</th><th>Upstream model</th><th>${esc(metrics.find(([id]) => id === state.metric)?.[1])}</th></tr></thead><tbody>${(state.stats?.layers || []).map((layer) => `<tr><th>Layer total</th><td>${esc(layer.name)}</td><td></td><td></td><td></td><td>${value(layer.totals)}</td></tr>${(layer.targets || []).map((target) => targetRow(target, layer.name)).join("")}`).join("")}${(state.stats?.historical_targets || []).map((target) => targetRow(target, target.layer_name || target.layer_index, true)).join("")}${state.stats?.unattributed?.calls ? `<tr><td>No final target</td><td colspan="4">No final layer or target recorded for these requests.</td><td>${value(state.stats.unattributed)}</td></tr>` : ""}</tbody></table></div>`;
+    `<tr><td>${historical ? "Historical target" : "Target"}</td><td>${esc(displayName(layer))}</td><td>${esc(displayName(target.backend))}</td><td>${esc(target.credential)}</td><td>${esc(target.upstream_model || target.model)}</td><td>${value(target.totals)}</td></tr>`;
+  return `<h1>Model statistics</h1><div class="buttons">${windows.map(([id, label]) => button("window", label, id, `aria-pressed="${id === state.window}"`)).join("")}</div><div class="buttons">${metrics.map(([id, label]) => button("metric", label, id, `aria-pressed="${id === state.metric}"`)).join("")}</div><p>Model total: ${value(state.stats?.totals)}</p><div class="table-scroll"><table><thead><tr><th>Entry</th><th>Layer</th><th>Account</th><th>Key</th><th>Upstream model</th><th>${esc(metrics.find(([id]) => id === state.metric)?.[1])}</th></tr></thead><tbody>${(state.stats?.layers || []).map((layer) => `<tr><th>Layer total</th><td>${esc(displayName(layer.name))}</td><td></td><td></td><td></td><td>${value(layer.totals)}</td></tr>${(layer.targets || []).map((target) => targetRow(target, layer.name)).join("")}`).join("")}${(state.stats?.historical_targets || []).map((target) => targetRow(target, target.layer_name || target.layer_index, true)).join("")}${state.stats?.unattributed?.calls ? `<tr><td>No final target</td><td colspan="4">No final layer or target recorded for these requests.</td><td>${value(state.stats.unattributed)}</td></tr>` : ""}</tbody></table></div>`;
 }
 function globalStatistics() {
   return `<h1>All statistics</h1><div class="buttons">${windows.map(([id, label]) => button("window", label, id, `aria-pressed="${id === state.window}"`)).join("")}</div><h2>Account totals</h2><div class="table-scroll"><table><thead><tr><th>Account</th><th>Attempts</th><th>Successes</th><th>Errors</th><th>Cache hit</th><th>Usage value estimate (USD)</th></tr></thead><tbody>${Object.entries(
@@ -252,7 +282,7 @@ function globalStatistics() {
     .map(([id, row]) => {
       const total =
         Number(row.cache_hit_tokens || 0) + Number(row.cache_miss_tokens || 0);
-      return `<tr><td>${esc(id)}</td><td>${row.attempts || 0}</td><td>${row.successes || 0}</td><td>${row.errors || 0}</td><td>${row.cache_reported_attempts ? (total ? (100 * row.cache_hit_tokens) / total : 0).toFixed(1) + "%" : "—"}</td><td>${Number(row.cost_usd || 0).toFixed(6)}</td></tr>`;
+      return `<tr><td>${esc(displayName(id))}</td><td>${row.attempts || 0}</td><td>${row.successes || 0}</td><td>${row.errors || 0}</td><td>${row.cache_reported_attempts ? (total ? (100 * row.cache_hit_tokens) / total : 0).toFixed(1) + "%" : "—"}</td><td>${Number(row.cost_usd || 0).toFixed(6)}</td></tr>`;
     })
     .join(
       "",
@@ -262,18 +292,20 @@ function globalStatistics() {
     .filter((a) => a.active)
     .map(
       (a) =>
-        `<tr><td>${esc(a.backend)}</td><td>${esc(a.credential)}</td><td>${esc(a.class)}</td><td>${esc(new Date(a.last_seen_ms).toLocaleString())}</td><td>${a.next_probe_at_ms ? esc(new Date(a.next_probe_at_ms).toLocaleString()) : "—"}</td></tr>`,
+        `<tr><td>${esc(displayName(a.backend))}</td><td>${esc(a.credential)}</td><td>${esc(a.class)}</td><td>${esc(new Date(a.last_seen_ms).toLocaleString())}</td><td>${a.next_probe_at_ms ? esc(new Date(a.next_probe_at_ms).toLocaleString()) : "—"}</td></tr>`,
     )
     .join("")}</tbody></table></div>`;
 }
 function updateLive() {
+  document.querySelectorAll("[data-pool-status]").forEach(node => node.textContent = poolText(node.dataset.poolStatus));
+  document.querySelectorAll("[data-pool-count]").forEach(node => node.textContent = poolText(node.dataset.poolCount));
   document.querySelectorAll("[data-price-backend]").forEach(node=>node.textContent=activePriceText(state.live?.pricing?.find(row=>row.backend===node.dataset.priceBackend&&row.model===node.dataset.priceModel)));
   const m = state.draft?.models[state.selected];
   const live = state.live?.models.find((row) => row.name === m?.name);
   const order = document.querySelector("#effective-order");
   if (order)
     order.textContent = live
-      ? `Live priority: ${live.effective_order.join(" → ")} · ${live.active_schedule || "Default order"}`
+      ? `Live priority: ${live.effective_order.map(displayName).join(" → ")} · ${live.active_schedule || "Default order"}`
       : "New model — not saved yet";
   document.querySelectorAll("[data-live-target]").forEach((node) => {
     const [layer, backend, credential, model] =
@@ -320,6 +352,8 @@ async function request(path, options = {}) {
   return data;
 }
 function adopt(data) {
+  const accountIndex = Number(state.accountTab?.split(":")[1]);
+  const selectedAccountId = state.draft?.backends[accountIndex]?.id;
   const selectedName = state.draft?.models[state.selected]?.name;
   const wasAll = state.selected === "all";
   resetChildren();
@@ -331,6 +365,11 @@ function adopt(data) {
     m.timezone ||= "UTC";
     m.schedules ||= [];
   });
+  if (state.accountTab?.startsWith("backend:")) {
+    const matchedAccount = state.draft.backends.findIndex(backend => backend.id === selectedAccountId);
+    state.accountTab = `backend:${matchedAccount >= 0 ? matchedAccount : Math.min(accountIndex, state.draft.backends.length - 1)}`;
+  }
+  normalizeAccountTab();
   state.revision = data.revision;
   const matched = state.draft.models.findIndex(model => model.name === selectedName);
   state.selected = wasAll || !state.draft.models.length ? "all" : matched >= 0 ? matched : Math.min(state.selected, Math.max(0, state.draft.models.length - 1));
@@ -521,9 +560,15 @@ app.addEventListener("change", (event) => {
       } else if (/\.order\.\d+$/.test(reference)) values = get(reference.split('.').slice(0, 2).join('.')).layers.map(layer => layer.name);
       if (values) {
         const current = get(reference);
-        select.innerHTML = [...new Set([...(current ? [current] : []), ...values])].map(value => `<option value="${esc(value)}" ${value === current ? 'selected' : ''}>${esc(value || 'None')}</option>`).join('');
+        select.innerHTML = [...new Set([...(current ? [current] : []), ...values])].map(value => `<option value="${esc(value)}" ${value === current ? 'selected' : ''}>${esc(optionName(reference, value) || 'None')}</option>`).join('');
       }
     });
+    state.draft.backends.forEach((backend, index) => {
+      const tab = app.querySelector(`[data-action="account-tab"][data-path="backend:${index}"]`);
+      if (tab) tab.textContent = displayName(backend.id || "New account");
+    });
+    const accountHeading = app.querySelector("[data-account-heading]");
+    if (accountHeading) accountHeading.textContent = displayName(state.draft.backends[Number(state.accountTab.split(":")[1])]?.id || "New account");
     state.draft.models.forEach((model, index) => {
       const rail = app.querySelector(`[data-action="select"][data-path="${index}"]`);
       if (rail) rail.textContent = model.name || 'New model';
@@ -539,8 +584,8 @@ function confirmRemoval(path, item) {
   const type = collection === "models"
     ? (path.startsWith("backends.") ? "upstream model" : "model")
     : ({ layers: "layer", targets: "target", schedules: "time window", backends: "account", credentials: "credential", windows: "price window", capacity_pools: "shared capacity pool" })[collection] || "item";
-  const name = item?.name || item?.id || (collection === "targets" ? [item.backend, item.credential, item.model].filter(Boolean).join(" / ") : "") || "Unnamed";
-  return confirm(`Delete ${type} "${name}"? This changes only the draft until Save.`);
+  const name = item?.name || item?.id || (collection === "targets" ? [displayName(item.backend), item.credential, item.model].filter(Boolean).join(" / ") : "") || "Unnamed";
+  return confirm(`Delete ${type} "${displayName(name)}"? This changes only the draft until Save.`);
 }
 app.addEventListener("click", async (event) => {
   const n = event.target.closest("[data-action]");
@@ -586,6 +631,12 @@ app.addEventListener("click", async (event) => {
         state.cursor = state.cursors.pop();
         await children();
       }
+      return;
+    }
+    if (a === "account-tab") {
+      if (p !== "pools" && p !== "runtime" && !(/^backend:\d+$/.test(p) && state.draft.backends[Number(p.split(":")[1])])) return;
+      state.accountTab = p;
+      render();
       return;
     }
     if (a === "accounts" || a === "workspace") {
@@ -658,8 +709,8 @@ app.addEventListener("click", async (event) => {
       if (generation !== state.childGeneration || view !== state.view || selectedName !== state.draft.models[state.selected]?.name || instant !== state.at) return;
       const model = data.models.find(model => model.name === selectedName);
       const pairs = new Set((model?.layers || []).flatMap(layer => layer.targets.map(target => JSON.stringify([target.backend, target.upstream_model]))));
-      state.preview = model ? `${model.active_schedule || "Default order"}: ${model.effective_order.join(" → ")}` : "Model not yet saved";
-      state.preview += "\n" + (data.pricing || []).filter(row => pairs.has(JSON.stringify([row.backend, row.model]))).map(row => `${row.backend}/${row.model}: ${activePriceText(row)}`).join("\n");
+      state.preview = model ? `${model.active_schedule || "Default order"}: ${model.effective_order.map(displayName).join(" → ")}` : "Model not yet saved";
+      state.preview += "\n" + (data.pricing || []).filter(row => pairs.has(JSON.stringify([row.backend, row.model]))).map(row => `${displayName(row.backend)}/${row.model}: ${activePriceText(row)}`).join("\n");
       const result = document.querySelector('#preview-result');
       if (result) result.textContent = state.preview;
       return;
@@ -681,6 +732,11 @@ app.addEventListener("click", async (event) => {
           );
         }
         array.splice(i, 1);
+        if (/^backends\.\d+$/.test(p)) {
+          const selectedAccount = Number(state.accountTab?.split(":")[1]);
+          if (state.accountTab?.startsWith("backend:")) state.accountTab = `backend:${selectedAccount > i ? selectedAccount - 1 : Math.min(selectedAccount, array.length - 1)}`;
+          normalizeAccountTab();
+        }
         if (/^models\.\d+$/.test(p)) {
           resetChildren();
           state.selected = array.length ? Math.min(i, array.length - 1) : "all";
@@ -740,6 +796,7 @@ app.addEventListener("click", async (event) => {
               : get(p);
       if (!Array.isArray(array)) return;
       array.push(defaults[a]);
+      if (a === "add-backend") state.accountTab = `backend:${array.length - 1}`;
       if (a === "add-layer") {
         get(p.split(".").slice(0, 2).join(".")).schedules.forEach((schedule) =>
           schedule.order.push(""),

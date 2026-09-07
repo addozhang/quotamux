@@ -144,7 +144,7 @@ the request; and server/unavailable errors are transient.
 
 Source: [Kimi Open Platform error types](https://platform.kimi.ai/docs/api/errors)
 
-### Zhipu Coding Plan
+### GLM Coding Plan
 
 Zhipu returns a business code inside the JSON error envelope in addition to the
 HTTP status. QuotaMux uses that code so subscription exhaustion is not confused

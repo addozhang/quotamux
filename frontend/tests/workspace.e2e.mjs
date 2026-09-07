@@ -67,7 +67,14 @@ async function enableEditing(page) {
   await action(page, "accounts").click();
   await expect(page.locator(".accounts-page")).toBeVisible();
   await expect(page.locator(".model-rail, .child-nav, .drawer-backdrop")).toHaveCount(0);
-  await expect(action(page, "add-backend")).toBeDisabled();
+  await expect(action(page, "add-backend")).toHaveCount(0);
+  await expect(page.locator('.accounts-page input,.accounts-page select')).toHaveCount(0);
+  await expect(action(page, 'account-tab', 'backend:0')).toHaveAttribute('aria-selected','true');
+  for (const tab of ['pools','runtime','backend:0']) {
+    await action(page,'account-tab',tab).click();
+    await expect(action(page,'account-tab',tab)).toHaveAttribute('aria-selected','true');
+    await expect(page.locator('.accounts-page input,.accounts-page select,.accounts-page [data-action="remove"]')).toHaveCount(0);
+  }
   await action(page, "workspace").click();
   await action(page, "select", "0").click();
   await expect(page.getByRole("heading", {name:"Model statistics", exact:true})).toBeVisible();
@@ -159,6 +166,8 @@ async function auditConfirmations(browser) {
     if (scope === 'workspace') {
       await action(page, 'select', '0').click();
       await action(page, 'view', 'routing').click();
+    } else {
+      await action(page, 'account-tab', path.startsWith('capacity_pools.') ? 'pools' : 'backend:0').click();
     }
     const before = await snapshot();
     let message = '';
@@ -180,6 +189,33 @@ async function auditConfirmations(browser) {
   }
   await page.close();
   console.log('PASS Save/Discard cancellation and all 10 delete kinds cancel/confirm without premature writes');
+}
+async function inspectReadonlyAccounts(browser) {
+  const page=await browser.newPage({viewport:{width:1280,height:900}});
+  await page.goto(base);
+  await action(page,'accounts').click();
+  await expect(page.locator('.accounts-page')).toBeVisible();
+  await expect(page.locator('main input,main select,main [data-action="add-backend"],main [data-action="remove"]')).toHaveCount(0);
+  await expect(page.locator('main')).toContainText('upstream-two');
+  await expect(page.locator('main')).toContainText('Subscription quota usage value');
+  await expect(page.locator('main')).toContainText('peak');
+  await expect(page.locator('main')).toContainText('UTC');
+  await expect(page.locator('main')).not.toContainText(key);
+  await page.screenshot({path:artifacts+'/account-readonly-desktop.png',fullPage:true});
+  for(const tab of ['backend:0','pools','runtime']) {
+    await action(page,'account-tab',tab).click();
+    await expect(page.locator('main input,main select,main textarea')).toHaveCount(0);
+    await page.setViewportSize({width:390,height:844});
+    assert(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth), `${tab} readonly mobile overflow`);
+    await page.screenshot({path:artifacts+`/account-readonly-${tab.replace(':','-')}-mobile.png`,fullPage:true});
+  }
+  await action(page,'account-tab','backend:0').click();
+  await action(page,'enable-edit').click();
+  await expect(field(page,'backends.0.models.1.pricing_note')).toHaveValue('Subscription quota usage value');
+  await action(page,'disable-edit').click();
+  await expect(page.locator('main input,main select')).toHaveCount(0);
+  await page.close();
+  console.log('PASS account tabs: isolated panels, clear readonly prices/credentials/runtime, mobile, and edit toggle');
 }
 async function physicalClick(page, locator) {
   await locator.evaluate(node => node.scrollIntoView({block:"center", inline:"nearest", behavior:"instant"}));
@@ -256,6 +292,7 @@ try {
   await sleep(5300);
   await expect(field(page, "models.0.aliases")).toHaveValue("draft-alias");
   await action(page, "accounts").first().click();
+  await action(page, "account-tab", "backend:0").click();
   await action(page, "add-backend").click();
   await field(page, "backends.1.id").fill("extra-account");
   await physicalClick(page, action(page,"add-credential","backends.1.credentials"));
@@ -266,17 +303,25 @@ try {
   await field(page, "backends.1.credentials.0.id").fill("extra");
   await field(page, "backends.1.credentials.0.id").blur();
   await field(page, "backends.1.credentials.0.api_key").fill(key);
+  await action(page, 'account-tab', 'backend:0').click();
+  await expect(field(page, 'backends.1.id')).toHaveCount(0);
+  await action(page, 'account-tab', 'backend:1').click();
+  await expect(field(page, 'backends.1.credentials.0.api_key')).toHaveValue(key);
   await action(page, "add-upstream", "backends.1.models").click();
   await field(page, "backends.1.models.0.name").fill("upstream");
   await field(page, "backends.1.models.0.name").blur();
   await save(page);
+  await expect(action(page, "account-tab", "backend:1")).toHaveAttribute("aria-selected", "true");
   page.once("dialog", dialog => dialog.accept());
   await action(page, "remove", "backends.1").click();
+  await expect(action(page, "account-tab", "backend:0")).toHaveAttribute("aria-selected", "true");
   await save(page);
+  await action(page, "account-tab", "pools").click();
   await action(page, "add-pool").click();
   await field(page, "capacity_pools.0.id").fill("shared");
   await field(page, "capacity_pools.0.id").blur();
   await field(page, "capacity_pools.0.max_in_flight").fill("2");
+  await action(page, "account-tab", "backend:0").click();
   await field(page, "backends.0.credentials.0.pool").selectOption("shared");
   await action(page, "add-credential", "backends.0.credentials").click();
   await field(page, "backends.0.credentials.1.id").fill("second");
@@ -296,7 +341,7 @@ try {
   await field(page,'backends.0.models.1.pricing_schedule.windows.0.name').fill('peak');
   await field(page,'backends.0.models.1.pricing_schedule.windows.0.name').blur();
   await field(page,'backends.0.models.1.pricing_schedule.windows.0.pricing.output_usd_per_million').fill('9');
-  await page.getByText("Advanced runtime settings", { exact: true }).click();
+  await action(page, "account-tab", "runtime").click();
   await expect(
     field(page, "server.timeouts.upstream_connect_ms"),
   ).toBeVisible();
@@ -338,6 +383,7 @@ try {
   console.log(
     "PASS unified edits, account credentials/pools/models/pricing, schedule selectors and preview, dirty polling",
   );
+  await inspectReadonlyAccounts(browser);
   await auditConfirmations(browser);
   const priced=await(await fetch(base+'/api/routing')).json();
   const pricedModel=priced.document.backends[0].models[1];
@@ -349,6 +395,7 @@ try {
     assert.equal(price.rates.output_usd_per_million,rate);assert.equal(price.active_window,active);
   }
   await action(page,'accounts').first().click();
+  await action(page,'account-tab','backend:0').click();
   page.once('dialog', dialog => dialog.accept());
   await action(page,'remove-pricing','backends.0.models.1').click();
   await save(page);
@@ -357,6 +404,7 @@ try {
   await action(page, "workspace").click();
   const before = await readFile(dir + "/config.toml", "utf8");
   await action(page, "accounts").first().click();
+  await action(page, "account-tab", "backend:0").click();
   await field(page, "backends.0.credentials.0.api_key").fill("invalid-key");
   await save(page, 422);
   assert.equal(await readFile(dir + "/config.toml", "utf8"), before);
@@ -418,10 +466,17 @@ try {
     await infer("fresh-edit");
   }
   const inferenceBody = (content) => ({method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({model:'second-public', messages:[{role:'user',content}]})});
+  const poolPage=await browser.newPage();
+  await poolPage.goto(base);
+  await action(poolPage,'accounts').click();
+  await action(poolPage,'account-tab','pools').click();
+  const occupancy=poolPage.locator('[data-live-pool="shared"]');
+  await expect(occupancy).toContainText('0 / 2');
   const held = [fetch(base+'/v1/chat/completions', inferenceBody('HOLD')), fetch(base+'/v1/chat/completions', inferenceBody('HOLD'))];
   try {
     for (let i=0; i<100 && heldRequests.length<2; i++) await sleep(50);
     assert.equal(heldRequests.length, 2, 'both shared pool slots are occupied');
+    await expect(occupancy).toContainText('2 / 2',{timeout:10000});
     const blocked = await fetch(base+'/v1/chat/completions', inferenceBody('OK'));
     assert.equal(blocked.status, 503);
     await blocked.json();
@@ -429,6 +484,8 @@ try {
     heldRequests.splice(0).forEach(release => release());
     for (const response of await Promise.all(held)) {assert.equal(response.status,200); await response.json();}
   }
+  await expect(occupancy).toContainText('0 / 2',{timeout:10000});
+  await poolPage.close();
   await action(page, 'select', '1').click();
   await action(page, 'window', 'all').click();
   const noTarget = page.locator('tbody tr').filter({hasText:'No final target'});
