@@ -156,7 +156,6 @@ async function auditConfirmations(browser) {
     ['workspace', 'remove', 'models.0.layers.0', 'layer'],
     ['workspace', 'remove', 'models.0.layers.0.targets.0', 'target'],
     ['workspace', 'remove', 'models.0.schedules.0', 'time window'],
-    ['accounts', 'remove', 'backends.0', 'account'],
     ['accounts', 'remove', 'backends.0.credentials.0', 'credential'],
     ['accounts', 'remove', 'backends.0.models.1', 'upstream model'],
     ['accounts', 'remove', 'backends.0.models.1.pricing_schedule.windows.0', 'price window'],
@@ -190,7 +189,70 @@ async function auditConfirmations(browser) {
     await expect(page.locator('#draft-status')).toHaveText('All changes saved');
   }
   await page.close();
-  console.log('PASS Save/Discard cancellation and all 10 delete kinds cancel/confirm without premature writes');
+  console.log('PASS Save/Discard cancellation and 9 delete kinds cancel/confirm without premature writes; unused account covered separately');
+}
+async function auditAccountDependencies(browser) {
+  const baseline = await (await fetch(base+'/api/routing')).json();
+  const bytes = await readFile(dir+'/config.toml');
+  const invalid = structuredClone(baseline.document);
+  const retained = structuredClone(invalid.backends[0]);
+  retained.id = 'unreferenced-account';
+  retained.credentials.forEach(credential => { credential.api_key = key; });
+  invalid.backends.splice(0,1);
+  invalid.backends.push(retained);
+  const rejected = await fetch(base+'/api/routing',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({revision:baseline.revision,document:invalid})});
+  const rejection = await rejected.text();
+  assert.equal(rejected.status,422,rejection);
+  assert.match(rejection,/references missing backend mock/);
+  const unchanged = await (await fetch(base+'/api/routing')).json();
+  assert.equal(unchanged.revision,baseline.revision);
+  assert.deepEqual(unchanged.document,baseline.document);
+  assert.deepEqual(await readFile(dir+'/config.toml'),bytes,'invalid account removal cannot persist');
+  const page = await browser.newPage({viewport:{width:1280,height:900}});
+  await enableEditing(page);
+  let puts=0,dialogs=0;
+  page.on('request',request=>{if(request.method()==='PUT') puts++;});
+  page.on('dialog',async dialog=>{dialogs++;await dialog.dismiss();});
+  // Add a new draft model targeting the same account. Existing lower-priority
+  // layers and this unsaved model must all participate in the dependency check.
+  await action(page,'add-model').click();
+  const index=baseline.document.models.length;
+  await field(page,`models.${index}.name`).fill('draft-dependent');
+  await field(page,`models.${index}.name`).blur();
+  await action(page,'add-layer',`models.${index}.layers`).click();
+  await field(page,`models.${index}.layers.0.name`).fill('draft-lower-layer');
+  await field(page,`models.${index}.layers.0.name`).blur();
+  await action(page,'add-target',`models.${index}.layers.0.targets`).click();
+  await field(page,`models.${index}.layers.0.targets.0.backend`).selectOption(baseline.document.backends[0].id);
+  await action(page,'accounts').click();
+  await action(page,'account-tab','backend:0').click();
+  const snapshot=()=>page.locator('main').evaluate(main=>[...main.querySelectorAll('input,select')].map(n=>[n.dataset.field,n.value,n.checked]));
+  const before=await snapshot();
+  for(const viewport of [{width:1280,height:900},{width:390,height:844}]) {
+    await page.setViewportSize(viewport);
+    await page.evaluate(()=>window.scrollTo(0,0));
+    const box=await action(page,'remove','backends.0').boundingBox();
+    assert(box && box.y>=0 && box.y+box.height<=viewport.height,'Delete account visible near heading without scrolling forms');
+    await physicalClick(page,action(page,'remove','backends.0'));
+    await expect(page.locator('#notice')).toContainText(`Cannot delete account "${baseline.document.backends[0].id}"`);
+    await expect(page.locator('#notice')).toContainText('draft-dependent / draft-lower-layer');
+    for(const model of baseline.document.models) for(const layer of model.layers) {
+      if(layer.targets.some(target=>target.backend===baseline.document.backends[0].id)) await expect(page.locator('#notice')).toContainText(`${model.name} / ${layer.name}`);
+    }
+    await expect(page.locator('#notice')).toContainText('Remove or replace these routing targets first.');
+    assert.deepEqual(await snapshot(),before,'blocked removal retains draft');
+    await expect(page.locator('#draft-status')).toHaveText('Unsaved changes');
+    assert.equal(dialogs,0,'referenced removal is blocked before confirmation');
+    assert.equal(puts,0);
+  }
+  await action(page,'workspace').click();
+  await action(page,'select',String(index)).click();
+  await action(page,'view','routing').click();
+  await expect(field(page,`models.${index}.name`)).toHaveValue('draft-dependent');
+  assert.equal((await(await fetch(base+'/api/routing')).json()).revision,baseline.revision);
+  assert.deepEqual(await readFile(dir+'/config.toml'),bytes);
+  await page.close();
+  console.log('PASS account dependency guard covers all layers and unsaved models, preserves drafts, desktop/mobile physical click; API rejects dangling targets atomically');
 }
 async function inspectReadonlyAccounts(browser) {
   const page=await browser.newPage({viewport:{width:1280,height:900}});
@@ -301,6 +363,13 @@ async function inspectSettingsAndCapacity(browser) {
   page.once('dialog',dialog=>dialog.accept());await action(page,'discard').click();
   const after = await (await fetch(base+'/api/routing')).json();
   assert.deepEqual(after.document,baseline.document,'Cross-account capacity edits remain draft-only');
+  await action(page,'workspace').click();
+  while (await action(page,'select','0').count()) {
+    await action(page,'select','0').click();
+    await action(page,'view','routing').click();
+    page.once('dialog',dialog=>dialog.accept());
+    await action(page,'remove','models.0').click();
+  }
   await action(page,'accounts').click();
   page.once('dialog',dialog=>dialog.accept());await action(page,'remove','backends.0').click();
   await expect(action(page,'account-tab')).toHaveCount(0);
@@ -397,8 +466,21 @@ try {
   await field(page, "backends.1.models.0.name").blur();
   await save(page);
   await expect(action(page, "account-tab", "backend:1")).toHaveAttribute("aria-selected", "true");
+  const unusedBaseline = await (await fetch(base+'/api/routing')).json();
+  let unusedPuts = 0;
+  const countUnusedPut = request => { if(request.method()==='PUT') unusedPuts++; };
+  page.on('request',countUnusedPut);
+  page.once('dialog',dialog=>dialog.dismiss());
+  await physicalClick(page,action(page,'remove','backends.1'));
+  await expect(action(page,'account-tab','backend:1')).toHaveAttribute('aria-selected','true');
+  await expect(field(page,'backends.1.id')).toHaveValue('extra-account');
+  await expect(page.locator('#draft-status')).toHaveText('All changes saved');
+  assert.equal(unusedPuts,0);
   page.once("dialog", dialog => dialog.accept());
-  await action(page, "remove", "backends.1").click();
+  await physicalClick(page, action(page, "remove", "backends.1"));
+  assert.equal(unusedPuts,0,'confirmed unused account deletion remains draft-only');
+  assert.equal((await(await fetch(base+'/api/routing')).json()).revision,unusedBaseline.revision);
+  page.off('request',countUnusedPut);
   await expect(action(page, "account-tab", "backend:0")).toHaveAttribute("aria-selected", "true");
   await save(page);
   await action(page, "add-pool", "backends.0.credentials.0").click();
@@ -468,6 +550,7 @@ try {
   );
   await inspectReadonlyAccounts(browser);
   await auditConfirmations(browser);
+  await auditAccountDependencies(browser);
   await inspectSettingsAndCapacity(browser);
   // The independent Settings page has saved and restored the shared document.
   await action(page,'discard').click();

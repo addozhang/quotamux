@@ -166,7 +166,7 @@ function accounts() {
 }
 function accountEditor(b, i) {
       const p = `backends.${i}`;
-      return `<p class="muted">Credentials stay blank when loaded. Leave an existing key blank to preserve it.</p><article><h3 data-account-heading>${esc(displayName(b.id || "New account"))}</h3><div class="row">${field(p + ".id", "Account ID")}${field(p + ".adapter", "Adapter", "text", adapters)}</div>${b.adapter.startsWith("custom-") ? field(p + ".endpoint", "Endpoint URL (blank preserves existing)") : '<p class="muted">Official endpoint managed by adapter</p>'}<h4>Credentials</h4>${b.credentials
+      return `<p class="muted">Credentials stay blank when loaded. Leave an existing key blank to preserve it.</p><article><div class="heading"><h3 data-account-heading>${esc(displayName(b.id || "New account"))}</h3>${button("remove", "Delete account", p)}</div><div class="row">${field(p + ".id", "Account ID")}${field(p + ".adapter", "Adapter", "text", adapters)}</div>${b.adapter.startsWith("custom-") ? field(p + ".endpoint", "Endpoint URL (blank preserves existing)") : '<p class="muted">Official endpoint managed by adapter</p>'}<h4>Credentials</h4>${b.credentials
         .map((c, j) => {
           const q = `${p}.credentials.${j}`;
           return `<div class="credential"><div class="row">${field(q + ".id", "Credential ID")}${field(q + ".api_key", "API key (blank preserves existing)", "password")}${field(q + ".pool", "Shared pool", "text", ["", ...(state.draft.capacity_pools || []).map((p) => p.id)])}</div>${!c.pool ? button("add-pool", "Create capacity pool", q) : ""}${button("remove", "Delete credential", q)}</div>`;
@@ -184,7 +184,7 @@ function accountEditor(b, i) {
         })
         .join(
           "",
-        )}${button("add-upstream", "+ Add upstream model", p + ".models")}${button("remove", "Delete account", p)}</article>`;
+        )}${button("add-upstream", "+ Add upstream model", p + ".models")}</article>`;
 }
 function infoRows(rows) {
   return `<dl class="info-grid">${rows.map(([label, value]) => `<div><dt>${esc(label)}</dt><dd>${esc(value ?? "—")}</dd></div>`).join("")}</dl>`;
@@ -624,6 +624,12 @@ app.addEventListener("change", (event) => {
     }
   }
 });
+function accountDependencies(id) {
+  if (!id) return [];
+  return state.draft.models.flatMap(model => model.layers
+    .filter(layer => layer.targets.some(target => target.backend === id))
+    .map(layer => `${model.name || "New model"} / ${displayName(layer.name || "New layer")}`));
+}
 function confirmRemoval(path, item) {
   const collection = path.split(".").at(-2);
   const type = collection === "models"
@@ -766,7 +772,16 @@ app.addEventListener("click", async (event) => {
         array = get(keys.join("."));
       if (!Array.isArray(array) || i < 0 || i >= array.length) return;
       if (a === "remove") {
+        if (/^backends\.\d+$/.test(p)) {
+          const dependencies = accountDependencies(array[i].id);
+          if (dependencies.length) {
+            state.message = `Cannot delete account "${displayName(array[i].id)}". Referenced by: ${dependencies.join(", ")}. Remove or replace these routing targets first.`;
+            status();
+            return;
+          }
+        }
         if (!confirmRemoval(p, array[i])) return;
+        if (/^backends\.\d+$/.test(p)) state.message = "";
         if (p.match(/^models\.\d+\.layers\.\d+$/)) {
           const model = get(keys.slice(0, 2).join("."));
           model.schedules.forEach(
