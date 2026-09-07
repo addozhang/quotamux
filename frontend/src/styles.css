@@ -262,22 +262,12 @@ footer [data-action="save"] {
   padding-top: 10px;
   padding-bottom: 10px;
 }
-.drawer-backdrop {
-  position: fixed;
-  inset: 66px 0 75px;
-  background: #0d1015b3;
-  z-index: 20;
-  display: flex;
-  justify-content: flex-end;
+.accounts-page {
+  max-width: 1280px;
+  margin: auto;
+  padding-bottom: 100px;
 }
-.accounts-drawer {
-  width: min(760px, 100%);
-  overflow-y: auto;
-  background: var(--bg);
-  padding: 24px;
-  border-left: 1px solid var(--line);
-}
-.accounts-drawer fieldset {
+.accounts-page fieldset {
   border: 1px solid var(--line);
   margin: 14px 0;
   padding: 14px;
@@ -367,12 +357,6 @@ td {
   article {
     padding: 14px;
   }
-  .drawer-backdrop {
-    inset: 66px 0 64px;
-  }
-  .accounts-drawer {
-    padding: 16px;
-  }
   .target-editor label {
     flex-basis: 100%;
   }
@@ -417,3 +401,5 @@ tbody tr:hover > * { background: #19202a; }
   color: var(--muted);
 }
 .child-nav [aria-pressed="true"] { color: var(--text); border-bottom-color: var(--accent); }
+
+.header-actions [aria-current="page"] { color: var(--accent); border-color: var(--accent); }

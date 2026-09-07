@@ -14,6 +14,7 @@ let child,
   browser,
   logs = "",
   requests = 0;
+const heldRequests = [];
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const mock = createServer(async (req, res) => {
   requests++;
@@ -25,6 +26,7 @@ const mock = createServer(async (req, res) => {
     return;
   }
   const data = JSON.parse(body);
+  if (data.messages?.[0]?.content === "HOLD") await new Promise(resolve => heldRequests.push(resolve));
   if (data.stream) {
     res.writeHead(200, { "Content-Type": "text/event-stream" });
     res.end(
@@ -57,18 +59,29 @@ const action = (page, a, p) =>
   );
 async function enableEditing(page) {
   await page.goto(base);
-  await expect(field(page, "models.0.name")).toBeDisabled();
-  await expect(action(page, "add-model")).toBeDisabled();
-  await action(page, "accounts").first().click();
+  await expect(page.getByRole("heading", {name:"All statistics", exact:true})).toBeVisible();
+  await expect(action(page, "window", "1d")).toHaveAttribute("aria-pressed", "true");
+  await expect(action(page, "add-model")).toHaveCount(0);
+  await expect(page.locator("footer")).toHaveCount(0);
+  await page.screenshot({path:artifacts+"/all-statistics-default.png",fullPage:true});
+  await action(page, "accounts").click();
+  await expect(page.locator(".accounts-page")).toBeVisible();
+  await expect(page.locator(".model-rail, .child-nav, .drawer-backdrop")).toHaveCount(0);
   await expect(action(page, "add-backend")).toBeDisabled();
-  await page
-    .getByRole("button", { name: "Close accounts", exact: true })
-    .last()
-    .click();
+  await action(page, "workspace").click();
+  await action(page, "select", "0").click();
+  await expect(page.getByRole("heading", {name:"Model statistics", exact:true})).toBeVisible();
+  await expect(action(page, "window", "1d")).toHaveAttribute("aria-pressed", "true");
+  await action(page, "view", "routing").click();
+  await expect(page.locator("#effective-order")).toContainText("Live priority:");
+  await expect(page.locator("main input, main select, main [data-action]")).toHaveCount(3); // only child navigation
+  await expect(field(page, "models.0.name")).toHaveCount(0);
+  await page.screenshot({path:artifacts+"/routing-readonly.png",fullPage:true});
   await action(page, "enable-edit").click();
   await expect(field(page, "models.0.name")).toBeEnabled();
+  await expect(action(page, "add-model")).toBeVisible();
   await action(page, "disable-edit").click();
-  await expect(field(page, "models.0.name")).toBeDisabled();
+  await expect(field(page, "models.0.name")).toHaveCount(0);
   await action(page, "enable-edit").click();
   const original = await field(page, "models.0.aliases").inputValue();
   await field(page, "models.0.aliases").fill("pending-edit");
@@ -78,9 +91,9 @@ async function enableEditing(page) {
   await expect(field(page, "models.0.aliases")).toBeEnabled();
   page.once('dialog', dialog=>dialog.accept());
   await action(page, "disable-edit").click();
-  await expect(field(page, "models.0.aliases")).toHaveValue(original);
-  await expect(field(page, "models.0.aliases")).toBeDisabled();
+  await expect(field(page, "models.0.aliases")).toHaveCount(0);
   await action(page, "enable-edit").click();
+  await expect(field(page, "models.0.aliases")).toHaveValue(original);
   await expect(page.getByTestId("save-workspace")).toBeEnabled();
 }
 async function save(page, status = 200) {
@@ -89,6 +102,7 @@ async function save(page, status = 200) {
       r.request().method() === "PUT" &&
       new URL(r.url()).pathname === "/api/routing",
   );
+  page.once("dialog", dialog => dialog.accept());
   await page.getByTestId("save-workspace").click();
   const result = await response;
   assert.equal(
@@ -100,10 +114,78 @@ async function save(page, status = 200) {
   if (status === 200)
     await expect(page.locator("#notice")).toContainText("Saved.");
 }
+async function auditConfirmations(browser) {
+  const page = await browser.newPage();
+  await enableEditing(page);
+  let puts = 0;
+  page.on('request', request => {
+    if (request.method() === 'PUT') puts++;
+  });
+  const baseline = await (await fetch(base + '/api/routing')).json();
+  await field(page, 'models.0.aliases').fill('cancel-save');
+  let saveDialog = '';
+  page.once('dialog', async dialog => {saveDialog = dialog.message(); await dialog.dismiss();});
+  await page.getByTestId('save-workspace').click();
+  assert.match(saveDialog, /immediately/);
+  await expect(field(page, 'models.0.aliases')).toHaveValue('cancel-save');
+  await expect(page.locator('#draft-status')).toHaveText('Unsaved changes');
+  assert.equal(puts, 0);
+  assert.equal((await (await fetch(base + '/api/routing')).json()).revision, baseline.revision);
+  page.once('dialog', dialog => dialog.dismiss());
+  await action(page, 'discard').click();
+  await expect(field(page, 'models.0.aliases')).toHaveValue('cancel-save');
+  page.once('dialog', dialog => dialog.accept());
+  await action(page, 'discard').click();
+  await expect(page.locator('#draft-status')).toHaveText('All changes saved');
+
+  const snapshot = () => page.locator('main').evaluate(main => ({
+    fields: [...main.querySelectorAll('input,select')].map(n => [n.dataset.field || n.dataset.choice || n.id, n.value, n.checked]),
+    actions: [...main.querySelectorAll('[data-action]')].map(n => [n.dataset.action, n.dataset.path]),
+  }));
+  const cases = [
+    ['workspace', 'remove', 'models.0', 'model'],
+    ['workspace', 'remove', 'models.0.layers.0', 'layer'],
+    ['workspace', 'remove', 'models.0.layers.0.targets.0', 'target'],
+    ['workspace', 'remove', 'models.0.schedules.0', 'time window'],
+    ['accounts', 'remove', 'backends.0', 'account'],
+    ['accounts', 'remove', 'backends.0.credentials.0', 'credential'],
+    ['accounts', 'remove', 'backends.0.models.1', 'upstream model'],
+    ['accounts', 'remove', 'backends.0.models.1.pricing_schedule.windows.0', 'price window'],
+    ['accounts', 'remove', 'capacity_pools.0', 'shared capacity pool'],
+    ['accounts', 'remove-pricing', 'backends.0.models.1', 'published rates'],
+  ];
+  for (const [scope, kind, path, label] of cases) {
+    await action(page, scope).click();
+    if (scope === 'workspace') {
+      await action(page, 'select', '0').click();
+      await action(page, 'view', 'routing').click();
+    }
+    const before = await snapshot();
+    let message = '';
+    page.once('dialog', async dialog => {message = dialog.message(); await dialog.dismiss();});
+    await action(page, kind, path).click();
+    assert(message.includes(label), `confirmation identifies ${label}: ${message}`);
+    assert(message.includes('draft until Save'), 'delete explains when it takes effect');
+    assert.deepEqual(await snapshot(), before, `${label}: cancel preserves draft`);
+    await expect(page.locator('#draft-status')).toHaveText('All changes saved');
+    page.once('dialog', dialog => dialog.accept());
+    await action(page, kind, path).click();
+    await expect(page.locator('#draft-status')).toHaveText('Unsaved changes');
+    assert.notDeepEqual(await snapshot(), before, `${label}: confirmed deletion changes draft`);
+    assert.equal(puts, 0, 'draft deletion must not issue a write');
+    assert.equal((await (await fetch(base + '/api/routing')).json()).revision, baseline.revision);
+    page.once('dialog', dialog => dialog.accept());
+    await action(page, 'discard').click();
+    await expect(page.locator('#draft-status')).toHaveText('All changes saved');
+  }
+  await page.close();
+  console.log('PASS Save/Discard cancellation and all 10 delete kinds cancel/confirm without premature writes');
+}
 async function physicalClick(page, locator) {
-  await locator.scrollIntoViewIfNeeded();
+  await locator.evaluate(node => node.scrollIntoView({block:"center", inline:"nearest", behavior:"instant"}));
   const box = await locator.boundingBox();
   assert(box, 'click target must be visible');
+  assert(await locator.evaluate(node => {const r=node.getBoundingClientRect(); return node.contains(document.elementFromPoint(r.x+r.width/2,r.y+r.height/2));}), 'physical click must hit its control');
   await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
   await page.mouse.down();
   await page.mouse.up();
@@ -188,6 +270,7 @@ try {
   await field(page, "backends.1.models.0.name").fill("upstream");
   await field(page, "backends.1.models.0.name").blur();
   await save(page);
+  page.once("dialog", dialog => dialog.accept());
   await action(page, "remove", "backends.1").click();
   await save(page);
   await action(page, "add-pool").click();
@@ -217,10 +300,7 @@ try {
   await expect(
     field(page, "server.timeouts.upstream_connect_ms"),
   ).toBeVisible();
-  await page
-    .getByRole("button", { name: "Close accounts", exact: true })
-    .last()
-    .click();
+  await action(page, "workspace").click();
   await action(page, "add-layer", "models.0.layers").click();
   await field(page, "models.0.layers.1.name").fill("second");
   await physicalClick(page, action(page, "add-target", "models.0.layers.1.targets"));
@@ -258,6 +338,7 @@ try {
   console.log(
     "PASS unified edits, account credentials/pools/models/pricing, schedule selectors and preview, dirty polling",
   );
+  await auditConfirmations(browser);
   const priced=await(await fetch(base+'/api/routing')).json();
   const pricedModel=priced.document.backends[0].models[1];
   assert.equal(pricedModel.pricing_note,'Subscription quota usage value');
@@ -268,11 +349,12 @@ try {
     assert.equal(price.rates.output_usd_per_million,rate);assert.equal(price.active_window,active);
   }
   await action(page,'accounts').first().click();
+  page.once('dialog', dialog => dialog.accept());
   await action(page,'remove-pricing','backends.0.models.1').click();
   await save(page);
   const removed=(await(await fetch(base+'/api/routing')).json()).document.backends[0].models[1];
   assert(!removed.pricing_schedule);assert(!removed.pricing);assert.equal(removed.pricing_note,'Subscription quota usage value');
-  await page.getByRole('button',{name:'Close accounts',exact:true}).last().click();
+  await action(page, "workspace").click();
   const before = await readFile(dir + "/config.toml", "utf8");
   await action(page, "accounts").first().click();
   await field(page, "backends.0.credentials.0.api_key").fill("invalid-key");
@@ -282,10 +364,7 @@ try {
     "invalid-key",
   );
   await field(page, "backends.0.credentials.0.api_key").fill("");
-  await page
-    .getByRole("button", { name: "Close accounts", exact: true })
-    .last()
-    .click();
+  await action(page, "workspace").click();
   const clean = await browser.newPage();
   await enableEditing(clean);
   const stale = await browser.newPage();
@@ -318,6 +397,8 @@ try {
   );
   await action(page, "select", "0").click();
   await action(page, "select", "1").click();
+  await expect(page.getByRole("heading", {name:"No saved data", exact:true})).toBeVisible();
+  await action(page, "view", "routing").click();
   await expect(field(page, "models.1.name")).toHaveValue("second-public");
   await save(page);
   await page.locator('#preview-at').fill('2026-09-07T10:00:00Z');
@@ -328,12 +409,34 @@ try {
   await action(page,'preview').click();
   await action(page,'select','0').click();
   await sleep(700);
+  await expect(page.locator('#preview-result')).toHaveCount(0);
+  await action(page, 'view', 'routing').click();
   await expect(page.locator('#preview-result')).toHaveText('');
   await page.unroute('**/api/routing?at=*');
   for (let i = 0; i < 25; i++) {
     await infer("second-public");
     await infer("fresh-edit");
   }
+  const inferenceBody = (content) => ({method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({model:'second-public', messages:[{role:'user',content}]})});
+  const held = [fetch(base+'/v1/chat/completions', inferenceBody('HOLD')), fetch(base+'/v1/chat/completions', inferenceBody('HOLD'))];
+  try {
+    for (let i=0; i<100 && heldRequests.length<2; i++) await sleep(50);
+    assert.equal(heldRequests.length, 2, 'both shared pool slots are occupied');
+    const blocked = await fetch(base+'/v1/chat/completions', inferenceBody('OK'));
+    assert.equal(blocked.status, 503);
+    await blocked.json();
+  } finally {
+    heldRequests.splice(0).forEach(release => release());
+    for (const response of await Promise.all(held)) {assert.equal(response.status,200); await response.json();}
+  }
+  await action(page, 'select', '1').click();
+  await action(page, 'window', 'all').click();
+  const noTarget = page.locator('tbody tr').filter({hasText:'No final target'});
+  await expect(noTarget).toHaveCount(1);
+  await expect(noTarget.locator('td').last()).toHaveText('1');
+  await action(page, 'metric', 'output_tokens').click();
+  await expect(noTarget.locator('td').last()).toHaveText('0');
+  console.log('PASS actual full-capacity rejection remains attributed to its model, with No final target shown only when needed');
   await action(page, "select", "0").click();
   await action(page, "view", "statistics").click();
   await expect(
@@ -344,7 +447,19 @@ try {
   await expect(
     page.getByRole("heading", { name: "Account totals" }),
   ).toHaveCount(0);
+  await expect(page.getByRole("heading", {name:"Active alerts", exact:true})).toHaveCount(0);
+  await expect(page.getByText("No final target", {exact:true})).toHaveCount(0);
   await action(page, "select", "all").click();
+  await expect(action(page, "window", "1d")).toHaveAttribute("aria-pressed", "true");
+  for (const window of ['1h', '1d', '1w', '1m', 'all']) {
+    const response = page.waitForResponse(r => new URL(r.url()).pathname === '/api/stats' && new URL(r.url()).searchParams.get('window') === window);
+    await action(page, 'window', window).click();
+    const stats = await (await response).json();
+    assert.equal(stats.window.id.toLowerCase(), window);
+    await expect(action(page, 'window', window)).toHaveAttribute('aria-pressed', 'true');
+    const row = page.locator('tbody tr').filter({has: page.locator('td:first-child', {hasText:/^mock$/})}).first();
+    await expect(row.locator('td').nth(1)).toHaveText(String(stats.backends.mock.attempts));
+  }
   await expect(action(page, "view", "routing")).toHaveCount(0);
   await expect(
     page.getByRole("heading", { name: "Account totals" }),
@@ -352,10 +467,21 @@ try {
   await expect(
     page.getByRole("heading", { name: "Active alerts" }),
   ).toBeVisible();
+  await page.route('**/api/stats?**', async route => {await sleep(500); await route.continue();});
+  await action(page, 'window', '1d').click();
+  await action(page, 'accounts').click();
+  await sleep(700);
+  await expect(page.locator('.accounts-page')).toBeVisible();
+  await expect(page.getByRole('heading', {name:'All statistics', exact:true})).toHaveCount(0);
+  await page.unroute('**/api/stats?**');
+  await action(page, 'workspace').click();
+  await expect(action(page, 'window', '1d')).toHaveAttribute('aria-pressed', 'true');
   await action(page, "view", "history").click();
   await expect(page.locator("tbody")).toContainText("public");
   await expect(page.locator("tbody")).toContainText("second-public");
   await action(page, "select", "0").click();
+  await expect(action(page, "view", "statistics")).toHaveAttribute("aria-pressed", "true");
+  await action(page, "view", "history").click();
   await expect(page.getByText("Page 1", { exact: true })).toBeVisible();
   await expect(page.locator("tbody")).not.toContainText("second-public");
   await expect(action(page, "older")).toBeEnabled();
@@ -363,6 +489,7 @@ try {
   await expect(page.getByText("Page 2", { exact: true })).toBeVisible();
   await expect(page.locator("tbody")).not.toContainText("second-public");
   await action(page, "select", "1").click();
+  await action(page, "view", "history").click();
   await expect(page.getByText("Page 1", { exact: true })).toBeVisible();
   await expect(page.locator("tbody")).toContainText("second-public");
   await page.route("**/api/requests?**", async (route) => {
@@ -371,7 +498,9 @@ try {
     await route.continue();
   });
   await action(page, "select", "0").click();
+  await action(page, "view", "history").click();
   await action(page, "select", "1").click();
+  await action(page, "view", "history").click();
   await expect(page.locator("tbody")).toContainText("second-public");
   await sleep(700);
   assert(
@@ -389,6 +518,7 @@ try {
   assert((await page.locator('tbody tr td:nth-child(2)').allTextContents()).every(name=>name==='second-public'));
   await expect(page.locator('tbody')).toContainText('second-public');
   await action(page, "view", "routing").click();
+  page.once("dialog", dialog => dialog.accept());
   await action(page, "remove", "models.0").click();
   await save(page);
   await page.screenshot({
@@ -406,6 +536,12 @@ try {
     path: artifacts + "/routing-workspace-mobile.png",
     fullPage: true,
   });
+  await action(page, 'accounts').click();
+  await expect(page.locator('.accounts-page')).toBeVisible();
+  assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), 'mobile Accounts overflow');
+  await page.screenshot({path: artifacts + '/accounts-mobile.png', fullPage:true});
+  await page.setViewportSize({width:1280, height:900});
+  await page.screenshot({path: artifacts + '/accounts-desktop.png', fullPage:true});
   assert.deepEqual(errors, []);
   console.log(
     "PASS invalid-key persistence protection, stale writer, model CRUD, stats/history, mobile and console",

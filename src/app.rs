@@ -2534,8 +2534,22 @@ fn safe_endpoint(endpoint: &str) -> String {
     url.to_string().trim_end_matches('/').to_string()
 }
 
-async fn stats(State(state): State<Arc<AppState>>) -> Response {
-    let rollup = match state.store.overview_rollup() {
+#[derive(Deserialize)]
+struct StatsQuery {
+    window: Option<String>,
+}
+
+async fn stats(State(state): State<Arc<AppState>>, Query(query): Query<StatsQuery>) -> Response {
+    let (window_id, from_ms, to_ms) = match routing_window(
+        query.window.as_deref().unwrap_or("all"),
+        Utc::now().timestamp_millis(),
+    ) {
+        Ok(window) => window,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response();
+        }
+    };
+    let rollup = match state.store.overview_rollup_window(from_ms, to_ms) {
         Ok(rollup) => rollup,
         Err(error) => {
             return (
@@ -2629,6 +2643,7 @@ async fn stats(State(state): State<Arc<AppState>>) -> Response {
         .collect::<Vec<_>>();
     let requests = rollup.requests;
     Json(json!({
+        "window": {"id": window_id, "from_ms": from_ms, "to_ms": to_ms},
         "requests":{
             "total":requests.calls,
             "errors":requests.errors,

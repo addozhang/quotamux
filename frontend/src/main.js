@@ -11,8 +11,8 @@ const state = {
   live: null,
   draft: null,
   revision: null,
-  selected: 0,
-  view: "routing",
+  selected: "all",
+  view: "statistics",
   accounts: false,
   editing: false,
   dirty: false,
@@ -24,7 +24,7 @@ const state = {
   history: null,
   totals: null,
   alerts: null,
-  window: "1h",
+  window: "1d",
   metric: "calls",
   cursor: null,
   cursors: [],
@@ -36,6 +36,7 @@ const browseActions = new Set([
   "enable-edit",
   "disable-edit",
   "accounts",
+  "workspace",
   "select",
   "view",
   "window",
@@ -85,7 +86,7 @@ function render() {
     return;
   }
   const model = state.draft.models[state.selected];
-  app.innerHTML = `<header><strong>QuotaMux</strong><span>Routing workspace</span><div class="header-actions">${button("accounts", state.accounts ? "Close accounts" : "Accounts")}${button(state.editing ? "disable-edit" : "enable-edit", state.editing ? "Disable edit" : "Enable edit")}</div></header><div id="notice" role="status" aria-live="polite">${esc(state.message)}</div><div id="migration-notice" role="status">${migrationMessage()}</div><div class="workspace"><aside class="model-rail"><h2>Models</h2>${button("select", "All", "all", `aria-current="${state.selected === "all" ? "page" : "false"}"`)}${state.draft.models.map((m, i) => button("select", m.name || "New model", String(i), `aria-current="${i === state.selected ? "page" : "false"}"`)).join("")}${button("add-model", "+ Add model")}<p class="muted">${state.live?.now ? "Live status " + esc(new Date(state.live.now).toLocaleTimeString()) : ""}</p></aside><main><nav class="child-nav" aria-label="Model views">${(state.selected === "all" ? ["statistics", "history"] : ["routing", "statistics", "history"]).map((v) => button("view", v[0].toUpperCase() + v.slice(1), v, `aria-pressed="${state.view === v}"`)).join("")}</nav>${state.view === "routing" ? (model ? modelEditor(model) : "<h1>Add your first model</h1>") : childView()}</main></div>${state.accounts ? accounts() : ""}<footer><span id="draft-status">${state.dirty ? "Unsaved changes" : "All changes saved"}</span><span>Save validates upstreams and immediately updates routing.</span>${button("discard", "Discard", "", state.busy ? "disabled" : "")}${button("save", state.busy ? "Validating and saving…" : "Save", "", `data-testid="save-workspace" ${state.busy || !state.editing ? "disabled" : ""}`)}</footer>`;
+  app.innerHTML = `<header><strong>QuotaMux</strong><span>Routing workspace</span><div class="header-actions">${button("workspace", "Workspace", "", `aria-current="${!state.accounts ? "page" : "false"}"`)}${button("accounts", "Accounts", "", `aria-current="${state.accounts ? "page" : "false"}"`)}${button(state.editing ? "disable-edit" : "enable-edit", state.editing ? "Disable edit" : "Enable edit")}</div></header><div id="notice" role="status" aria-live="polite">${esc(state.message)}</div><div id="migration-notice" role="status">${migrationMessage()}</div>${state.accounts ? accounts() : `<div class="workspace"><aside class="model-rail"><h2>Models</h2>${button("select", "All", "all", `aria-current="${state.selected === "all" ? "page" : "false"}"`)}${state.draft.models.map((m, i) => button("select", m.name || "New model", String(i), `aria-current="${i === state.selected ? "page" : "false"}"`)).join("")}${state.editing ? button("add-model", "+ Add model") : ""}<p class="muted">${state.live?.now ? "Live status " + esc(new Date(state.live.now).toLocaleTimeString()) : ""}</p></aside><main><nav class="child-nav" aria-label="Model views">${(state.selected === "all" ? ["statistics", "history"] : ["routing", "statistics", "history"]).map((v) => button("view", v[0].toUpperCase() + v.slice(1), v, `aria-pressed="${state.view === v}"`)).join("")}</nav>${state.view === "routing" ? (model ? modelEditor(model) : "<h1>Add your first model</h1>") : childView()}</main></div>`}${state.editing ? `<footer><span id="draft-status">${state.dirty ? "Unsaved changes" : "All changes saved"}</span><span>Save validates upstreams and immediately updates routing.</span>${button("discard", "Discard", "", state.busy ? "disabled" : "")}${button("save", state.busy ? "Validating and saving…" : "Save", "", `data-testid="save-workspace" ${state.busy || !state.editing ? "disabled" : ""}`)}</footer>` : ""}`;
   if (state.busy)
     app
       .querySelectorAll("input,select,button")
@@ -101,6 +102,7 @@ function render() {
   updateLive();
 }
 function modelEditor(m) {
+  if (!state.editing) return `<div class="heading"><div><p class="eyebrow">Public model</p><h1>${esc(m.name || "New model")}</h1></div></div><div class="effective" id="effective-order"></div>`;
   const p = `models.${state.selected}`;
   return `<div class="heading"><div><p class="eyebrow">Public model</p><h1>${esc(m.name || "New model")}</h1></div>${button("remove", "Delete model", p)}</div><div class="row">${field(p + ".name", "Model name")}${field(p + ".aliases", "Aliases (comma separated)", "list")}</div>${choices(
     p + ".protocols",
@@ -137,7 +139,7 @@ function modelEditor(m) {
     )}<div class="preview"><h3>Preview saved policy</h3><p class="muted">Read-only preview uses the currently saved rules, not unsaved edits.</p><label><span>Instant (RFC3339 with timezone)</span><input id="preview-at" value="${esc(state.at)}" placeholder="2026-09-07T12:00:00Z"></label>${button("preview", "Preview saved order")}<div id="preview-result">${state.preview ? esc(state.preview) : ""}</div></div></section>`;
 }
 function accounts() {
-  return `<div class="drawer-backdrop"><aside class="accounts-drawer" aria-label="Accounts"><div class="heading"><h2>Accounts and shared capacity</h2>${button("accounts", "Close accounts")}</div><p class="muted">Credentials stay blank when loaded. Leave an existing key blank to preserve it.</p>${state.draft.backends
+  return `<main class="accounts-page" aria-label="Accounts"><div class="heading"><h1>Accounts and shared capacity</h1></div><p class="muted">Credentials stay blank when loaded. Leave an existing key blank to preserve it.</p>${state.draft.backends
     .map((b, i) => {
       const p = `backends.${i}`;
       return `<article><h3>${esc(b.id || "New account")}</h3><div class="row">${field(p + ".id", "Account ID")}${field(p + ".adapter", "Adapter", "text", adapters)}</div>${b.adapter.startsWith("custom-") ? field(p + ".endpoint", "Endpoint URL (blank preserves existing)") : '<p class="muted">Official endpoint managed by adapter</p>'}<h4>Credentials</h4>${b.credentials
@@ -162,7 +164,7 @@ function accounts() {
     })
     .join(
       "",
-    )}${button("add-backend", "+ Add account")}<h3>Shared capacity pools</h3><p class="muted">Assign credentials above. No pool means no local concurrency limit.</p>${(state.draft.capacity_pools || []).map((p, i) => `<article><div class="row">${field(`capacity_pools.${i}.id`, "Pool ID")}${field(`capacity_pools.${i}.max_in_flight`, "Maximum concurrent requests", "number")}${button("remove", "Delete pool", `capacity_pools.${i}`)}</div></article>`).join("")}${button("add-pool", "+ Add pool")}${advanced()}</aside></div>`;
+    )}${button("add-backend", "+ Add account")}<h3>Shared capacity pools</h3><p class="muted">Assign credentials above. No pool means no local concurrency limit.</p>${(state.draft.capacity_pools || []).map((p, i) => `<article><div class="row">${field(`capacity_pools.${i}.id`, "Pool ID")}${field(`capacity_pools.${i}.max_in_flight`, "Maximum concurrent requests", "number")}${button("remove", "Delete pool", `capacity_pools.${i}`)}</div></article>`).join("")}${button("add-pool", "+ Add pool")}${advanced()}</main>`;
 }
 const windows = [
   ["1h", "1 hour"],
@@ -241,10 +243,10 @@ function childView() {
     Number(totals?.[state.metric] || 0).toLocaleString();
   const targetRow = (target, layer, historical = false) =>
     `<tr><td>${historical ? "Historical target" : "Target"}</td><td>${esc(layer)}</td><td>${esc(target.backend)}</td><td>${esc(target.credential)}</td><td>${esc(target.upstream_model || target.model)}</td><td>${value(target.totals)}</td></tr>`;
-  return `<h1>Model statistics</h1><div class="buttons">${windows.map(([id, label]) => button("window", label, id, `aria-pressed="${id === state.window}"`)).join("")}</div><div class="buttons">${metrics.map(([id, label]) => button("metric", label, id, `aria-pressed="${id === state.metric}"`)).join("")}</div><p>Model total: ${value(state.stats?.totals)}</p><div class="table-scroll"><table><thead><tr><th>Entry</th><th>Layer</th><th>Account</th><th>Key</th><th>Upstream model</th><th>${esc(metrics.find(([id]) => id === state.metric)?.[1])}</th></tr></thead><tbody>${(state.stats?.layers || []).map((layer) => `<tr><th>Layer total</th><td>${esc(layer.name)}</td><td></td><td></td><td></td><td>${value(layer.totals)}</td></tr>${(layer.targets || []).map((target) => targetRow(target, layer.name)).join("")}`).join("")}${(state.stats?.historical_targets || []).map((target) => targetRow(target, target.layer_name || target.layer_index, true)).join("")}<tr><td>Unattributed</td><td colspan="4"></td><td>${value(state.stats?.unattributed)}</td></tr></tbody></table></div>`;
+  return `<h1>Model statistics</h1><div class="buttons">${windows.map(([id, label]) => button("window", label, id, `aria-pressed="${id === state.window}"`)).join("")}</div><div class="buttons">${metrics.map(([id, label]) => button("metric", label, id, `aria-pressed="${id === state.metric}"`)).join("")}</div><p>Model total: ${value(state.stats?.totals)}</p><div class="table-scroll"><table><thead><tr><th>Entry</th><th>Layer</th><th>Account</th><th>Key</th><th>Upstream model</th><th>${esc(metrics.find(([id]) => id === state.metric)?.[1])}</th></tr></thead><tbody>${(state.stats?.layers || []).map((layer) => `<tr><th>Layer total</th><td>${esc(layer.name)}</td><td></td><td></td><td></td><td>${value(layer.totals)}</td></tr>${(layer.targets || []).map((target) => targetRow(target, layer.name)).join("")}`).join("")}${(state.stats?.historical_targets || []).map((target) => targetRow(target, target.layer_name || target.layer_index, true)).join("")}${state.stats?.unattributed?.calls ? `<tr><td>No final target</td><td colspan="4">No final layer or target recorded for these requests.</td><td>${value(state.stats.unattributed)}</td></tr>` : ""}</tbody></table></div>`;
 }
 function globalStatistics() {
-  return `<h1>All statistics</h1><p>All time</p><h2>Account totals</h2><div class="table-scroll"><table><thead><tr><th>Account</th><th>Attempts</th><th>Successes</th><th>Errors</th><th>Cache hit</th><th>Usage value estimate (USD)</th></tr></thead><tbody>${Object.entries(
+  return `<h1>All statistics</h1><div class="buttons">${windows.map(([id, label]) => button("window", label, id, `aria-pressed="${id === state.window}"`)).join("")}</div><h2>Account totals</h2><div class="table-scroll"><table><thead><tr><th>Account</th><th>Attempts</th><th>Successes</th><th>Errors</th><th>Cache hit</th><th>Usage value estimate (USD)</th></tr></thead><tbody>${Object.entries(
     state.totals?.backends || {},
   )
     .map(([id, row]) => {
@@ -254,7 +256,7 @@ function globalStatistics() {
     })
     .join(
       "",
-    )}</tbody></table></div><h2>Active alerts</h2><div class="table-scroll"><table><thead><tr><th>Account</th><th>Key</th><th>Class</th><th>Last seen</th><th>Next probe</th></tr></thead><tbody>${(
+    )}</tbody></table></div><h2>Active alerts</h2><p class="muted">Current account and credential alerts, independent of the statistics time range.</p><div class="table-scroll"><table><thead><tr><th>Account</th><th>Key</th><th>Class</th><th>Last seen</th><th>Next probe</th></tr></thead><tbody>${(
     state.alerts?.alerts || []
   )
     .filter((a) => a.active)
@@ -331,9 +333,10 @@ function adopt(data) {
   });
   state.revision = data.revision;
   const matched = state.draft.models.findIndex(model => model.name === selectedName);
-  state.selected = wasAll ? "all" : matched >= 0 ? matched : Math.min(state.selected, Math.max(0, state.draft.models.length - 1));
+  state.selected = wasAll || !state.draft.models.length ? "all" : matched >= 0 ? matched : Math.min(state.selected, Math.max(0, state.draft.models.length - 1));
   state.dirty = false;
-  if (state.view !== 'routing') queueMicrotask(() => children());
+  if (state.selected === 'all' && state.view === 'routing') state.view = 'statistics';
+  if (!state.accounts && state.view !== 'routing') queueMicrotask(() => children());
 }
 async function refresh() {
   try {
@@ -372,6 +375,7 @@ function resetChildren() {
   state.loading = false;
 }
 async function children() {
+  if (state.accounts || state.view === "routing") return;
   const generation = ++state.childGeneration;
   const selected = state.selected,
     view = state.view,
@@ -392,7 +396,7 @@ async function children() {
     if (view === "statistics")
       result =
         selected === "all"
-          ? await Promise.all([request("/api/stats"), request("/api/status")])
+          ? await Promise.all([request(`/api/stats?window=${window}`), request("/api/status")])
           : await request(
               `/api/routing/stats?model=${encodeURIComponent(model.name)}&window=${window}`,
             );
@@ -524,15 +528,23 @@ app.addEventListener("change", (event) => {
       const rail = app.querySelector(`[data-action="select"][data-path="${index}"]`);
       if (rail) rail.textContent = model.name || 'New model';
     });
-    if (state.view === 'routing') {
+    if (!state.accounts && state.view === 'routing') {
       const heading = app.querySelector('main h1');
       if (heading) heading.textContent = state.draft.models[state.selected]?.name || 'New model';
     }
   }
 });
+function confirmRemoval(path, item) {
+  const collection = path.split(".").at(-2);
+  const type = collection === "models"
+    ? (path.startsWith("backends.") ? "upstream model" : "model")
+    : ({ layers: "layer", targets: "target", schedules: "time window", backends: "account", credentials: "credential", windows: "price window", capacity_pools: "shared capacity pool" })[collection] || "item";
+  const name = item?.name || item?.id || (collection === "targets" ? [item.backend, item.credential, item.model].filter(Boolean).join(" / ") : "") || "Unnamed";
+  return confirm(`Delete ${type} "${name}"? This changes only the draft until Save.`);
+}
 app.addEventListener("click", async (event) => {
   const n = event.target.closest("[data-action]");
-  if (!n || state.busy) return;
+  if (!n || n.disabled || state.busy) return;
   const a = n.dataset.action,
     p = n.dataset.path;
   if ((!state.editing) && !browseActions.has(a)) return;
@@ -576,16 +588,21 @@ app.addEventListener("click", async (event) => {
       }
       return;
     }
-    if (a === "accounts") {
-      state.accounts = !state.accounts;
+    if (a === "accounts" || a === "workspace") {
+      const accountsPage = a === "accounts";
+      if (state.accounts === accountsPage) return;
+      resetChildren();
+      state.accounts = accountsPage;
       render();
+      if (!state.accounts) await children();
       return;
     }
     if (a === "select") {
       resetChildren();
       state.selected = p === "all" ? "all" : Number(p);
-      if (state.selected === "all" && state.view === "routing")
-        state.view = "statistics";
+      state.view = "statistics";
+      state.window = "1d";
+      state.metric = "calls";
       state.preview = null;
       render();
       if (state.view !== "routing") await children();
@@ -607,6 +624,7 @@ app.addEventListener("click", async (event) => {
       return;
     }
     if (a === "save") {
+      if (!confirm("Save all pending changes, including accounts, prices and shared capacity? After validation, the saved configuration applies immediately to new requests.")) return;
       state.busy = true;
       state.message = "Validating upstreams and saving…";
       render();
@@ -650,7 +668,9 @@ app.addEventListener("click", async (event) => {
       const keys = p.split("."),
         i = Number(keys.pop()),
         array = get(keys.join("."));
+      if (!Array.isArray(array) || i < 0 || i >= array.length) return;
       if (a === "remove") {
+        if (!confirmRemoval(p, array[i])) return;
         if (p.match(/^models\.\d+\.layers\.\d+$/)) {
           const model = get(keys.slice(0, 2).join("."));
           model.schedules.forEach(
@@ -661,6 +681,14 @@ app.addEventListener("click", async (event) => {
           );
         }
         array.splice(i, 1);
+        if (/^models\.\d+$/.test(p)) {
+          resetChildren();
+          state.selected = array.length ? Math.min(i, array.length - 1) : "all";
+          state.view = "statistics";
+          state.window = "1d";
+          state.metric = "calls";
+          state.preview = null;
+        }
       } else {
         const j = i + (a === "up" ? -1 : 1);
         if (j >= 0 && j < array.length)
@@ -710,6 +738,7 @@ app.addEventListener("click", async (event) => {
             : a === "add-pool"
               ? state.draft.capacity_pools
               : get(p);
+      if (!Array.isArray(array)) return;
       array.push(defaults[a]);
       if (a === "add-layer") {
         get(p.split(".").slice(0, 2).join(".")).schedules.forEach((schedule) =>
@@ -724,7 +753,12 @@ app.addEventListener("click", async (event) => {
         cache_miss_input_usd_per_million: 0,
         output_usd_per_million: 0,
       };
-    if (a === "remove-pricing") {delete get(p).pricing;delete get(p).pricing_schedule;}
+    if (a === "remove-pricing") {
+      const model = get(p);
+      if (!model || !confirm(`Remove published rates and all price windows for upstream model "${model.name || "Unnamed"}"? This changes only the draft until Save.`)) return;
+      delete model.pricing;
+      delete model.pricing_schedule;
+    }
     if (a === "add-price-window") {
       const model=get(p);
       model.pricing_schedule ||= {timezone:'UTC',windows:[]};
@@ -732,6 +766,7 @@ app.addEventListener("click", async (event) => {
     }
     state.dirty = true;
     render();
+    if (a === "remove" && /^models\.\d+$/.test(p)) await children();
   } catch (e) {
     state.message = e.message;
     status();

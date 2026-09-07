@@ -38,6 +38,17 @@ const REQUEST_ROLLUP_ALL: TableDefinition<RequestAllKey<'static>, RequestRollupV
     TableDefinition::new("request_rollup_all_v1");
 const ATTEMPT_ROLLUP_ALL: TableDefinition<(&str, &str), AttemptRollupValue> =
     TableDefinition::new("attempt_rollup_all_v1");
+type AttemptBucketKey<'a> = (u8, i64, &'a str, &'a str);
+const ATTEMPT_ROLLUP_BUCKET: TableDefinition<AttemptBucketKey<'static>, AttemptRollupValue> =
+    TableDefinition::new("attempt_rollup_bucket_v1");
+const ATTEMPT_BUCKET_META_KEY: &str = "attempt_buckets";
+
+#[derive(Default, Deserialize, Serialize)]
+struct AttemptBucketMeta {
+    cursor: Option<String>,
+    ready: bool,
+}
+
 const STATS_META: TableDefinition<&str, &[u8]> = TableDefinition::new("stats_meta_v1");
 
 const STATS_META_KEY: &str = "rollup";
@@ -173,6 +184,9 @@ impl Store {
             .open_table(ATTEMPT_ROLLUP_ALL)
             .map_err(|error| error.to_string())?;
         transaction
+            .open_table(ATTEMPT_ROLLUP_BUCKET)
+            .map_err(|error| error.to_string())?;
+        transaction
             .open_table(STATS_META)
             .map_err(|error| error.to_string())?;
         transaction.commit().map_err(|error| error.to_string())?;
@@ -194,6 +208,7 @@ impl Store {
                 StatsPhase::Ready => break,
             }
         }
+        self.ensure_attempt_buckets()?;
         self.prune_expired_stats()
     }
 
@@ -308,6 +323,7 @@ impl Store {
                 .map_err(|error| error.to_string())?;
         }
         apply_attempt_rollup(&transaction, record)?;
+        apply_attempt_buckets(&transaction, record, Utc::now().timestamp_millis())?;
         transaction.commit().map_err(|error| error.to_string())
     }
 
@@ -429,35 +445,9 @@ impl Store {
                 let table = transaction
                     .open_table(REQUEST_ROLLUP_BUCKET)
                     .map_err(|error| error.to_string())?;
-                let first_full_hour = ceil_to(from_ms, HOUR_MS);
-                let last_full_hour = floor_to(to_ms, HOUR_MS);
-                let left_end = first_full_hour.min(to_ms);
-                add_bucket_range(
-                    &table,
-                    served_model,
-                    GRAIN_MINUTE,
-                    from_ms,
-                    left_end,
-                    &mut result,
-                )?;
-                if first_full_hour < last_full_hour {
-                    add_bucket_range(
-                        &table,
-                        served_model,
-                        GRAIN_HOUR,
-                        first_full_hour,
-                        last_full_hour,
-                        &mut result,
-                    )?;
+                for (grain, start, end) in bucket_ranges(from_ms, to_ms) {
+                    add_bucket_range(&table, served_model, grain, start, end, &mut result)?;
                 }
-                add_bucket_range(
-                    &table,
-                    served_model,
-                    GRAIN_MINUTE,
-                    last_full_hour.max(left_end),
-                    to_ms,
-                    &mut result,
-                )?;
             }
             _ => return Err("statistics range must provide a valid from_ms and to_ms".into()),
         }
@@ -499,6 +489,119 @@ impl Store {
         Ok(result)
     }
 
+    /// Bounded overview uses the same completed-minute ranges as model statistics.
+    pub fn overview_rollup_window(
+        &self,
+        from_ms: Option<i64>,
+        to_ms: Option<i64>,
+    ) -> Result<OverviewRollup, String> {
+        let (from_ms, to_ms) = match (from_ms, to_ms) {
+            (None, None) => return self.overview_rollup(),
+            (Some(from), Some(to)) if from <= to => (from, to),
+            _ => return Err("statistics range must provide a valid from_ms and to_ms".into()),
+        };
+        let transaction = self
+            .database
+            .begin_read()
+            .map_err(|error| error.to_string())?;
+        let all = transaction
+            .open_table(REQUEST_ROLLUP_ALL)
+            .map_err(|error| error.to_string())?;
+        let requests = transaction
+            .open_table(REQUEST_ROLLUP_BUCKET)
+            .map_err(|error| error.to_string())?;
+        let attempts = transaction
+            .open_table(ATTEMPT_ROLLUP_BUCKET)
+            .map_err(|error| error.to_string())?;
+        let mut result = OverviewRollup::default();
+        for entry in all.iter().map_err(|error| error.to_string())? {
+            let (key, _) = entry.map_err(|error| error.to_string())?;
+            let (model, scope, ..) = key.value();
+            if scope != SCOPE_MODEL {
+                continue;
+            }
+            let mut model_result = RoutingRollup::default();
+            for (grain, start, end) in bucket_ranges(from_ms, to_ms) {
+                add_bucket_range(&requests, model, grain, start, end, &mut model_result)?;
+            }
+            result.requests.checked_add_assign(model_result.total)?;
+        }
+        for (grain, start, end) in bucket_ranges(from_ms, to_ms) {
+            if start >= end {
+                continue;
+            }
+            for entry in attempts
+                .range((grain, start, "", "")..(grain, end, "", ""))
+                .map_err(|error| error.to_string())?
+            {
+                let (key, value) = entry.map_err(|error| error.to_string())?;
+                let (_, _, backend, model) = key.value();
+                result
+                    .attempts
+                    .entry((backend.to_owned(), model.to_owned()))
+                    .or_default()
+                    .checked_add_assign(AttemptRollup::from(value.value()))?;
+            }
+        }
+        Ok(result)
+    }
+
+    fn ensure_attempt_buckets(&self) -> Result<(), String> {
+        let mut meta = {
+            let transaction = self
+                .database
+                .begin_read()
+                .map_err(|error| error.to_string())?;
+            let table = transaction
+                .open_table(STATS_META)
+                .map_err(|error| error.to_string())?;
+            table
+                .get(ATTEMPT_BUCKET_META_KEY)
+                .map_err(|error| error.to_string())?
+                .map(|value| {
+                    serde_json::from_slice::<AttemptBucketMeta>(value.value())
+                        .map_err(|error| error.to_string())
+                })
+                .transpose()?
+                .unwrap_or_default()
+        };
+        while !meta.ready {
+            self.backfill_attempt_buckets_batch(&mut meta)?;
+        }
+        Ok(())
+    }
+
+    fn backfill_attempt_buckets_batch(&self, meta: &mut AttemptBucketMeta) -> Result<(), String> {
+        let transaction = self
+            .database
+            .begin_write()
+            .map_err(|error| error.to_string())?;
+        let rows = {
+            let table = transaction
+                .open_table(ATTEMPTS)
+                .map_err(|error| error.to_string())?;
+            read_batch::<AttemptRecord>(&table, meta.cursor.as_deref())?
+        };
+        let now = Utc::now().timestamp_millis();
+        for (_, record) in &rows {
+            apply_attempt_buckets(&transaction, record, now)?;
+        }
+        if let Some((key, _)) = rows.last() {
+            meta.cursor = Some(key.clone());
+        }
+        meta.ready = rows.len() < MIGRATION_BATCH_SIZE;
+        {
+            let bytes = serde_json::to_vec(meta).map_err(|error| error.to_string())?;
+            let mut table = transaction
+                .open_table(STATS_META)
+                .map_err(|error| error.to_string())?;
+            table
+                .insert(ATTEMPT_BUCKET_META_KEY, bytes.as_slice())
+                .map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
     pub fn prune_stats(&self, cutoff_ms: i64) -> Result<(), String> {
         let cutoff = floor_to(cutoff_ms, MINUTE_MS);
         let transaction = self
@@ -511,6 +614,14 @@ impl Store {
                 .map_err(|error| error.to_string())?;
             table
                 .retain(|key, _| key.2 >= cutoff)
+                .map_err(|error| error.to_string())?;
+        }
+        {
+            let mut table = transaction
+                .open_table(ATTEMPT_ROLLUP_BUCKET)
+                .map_err(|error| error.to_string())?;
+            table
+                .retain(|key, _| key.1 >= cutoff)
                 .map_err(|error| error.to_string())?;
         }
         transaction.commit().map_err(|error| error.to_string())
@@ -838,6 +949,15 @@ fn require_stats_ready(transaction: &WriteTransaction) -> Result<(), String> {
     if meta.version != STATS_SCHEMA_VERSION || meta.phase != StatsPhase::Ready {
         return Err("statistics schema migration is not complete".into());
     }
+    let bucket_meta = table
+        .get(ATTEMPT_BUCKET_META_KEY)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "attempt bucket migration is not initialized".to_string())?;
+    let bucket_meta: AttemptBucketMeta =
+        serde_json::from_slice(bucket_meta.value()).map_err(|error| error.to_string())?;
+    if !bucket_meta.ready {
+        return Err("attempt bucket migration is not complete".into());
+    }
     Ok(())
 }
 
@@ -996,18 +1116,7 @@ fn apply_attempt_rollup(
     transaction: &WriteTransaction,
     record: &AttemptRecord,
 ) -> Result<(), String> {
-    let delta = AttemptRollup {
-        attempts: 1,
-        successes: u64::from(record.error_class.is_none()),
-        errors: u64::from(record.error_class.is_some()),
-        cache_reported_attempts: u64::from(record.usage.provider_reported),
-        cache_hit_tokens: record.usage.cache_hit_tokens,
-        cache_miss_tokens: record.usage.cache_miss_tokens,
-        cost_usd: record.provider_cost_usd.unwrap_or(0.0),
-    };
-    if !delta.cost_usd.is_finite() {
-        return Err("provider cost is not finite".into());
-    }
+    let delta = attempt_delta(record)?;
     let key = (record.backend.as_str(), record.upstream_model.as_str());
     let mut table = transaction
         .open_table(ATTEMPT_ROLLUP_ALL)
@@ -1022,6 +1131,65 @@ fn apply_attempt_rollup(
         .insert(key, AttemptRollupValue::from(value))
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn attempt_delta(record: &AttemptRecord) -> Result<AttemptRollup, String> {
+    let delta = AttemptRollup {
+        attempts: 1,
+        successes: u64::from(record.error_class.is_none()),
+        errors: u64::from(record.error_class.is_some()),
+        cache_reported_attempts: u64::from(record.usage.provider_reported),
+        cache_hit_tokens: record.usage.cache_hit_tokens,
+        cache_miss_tokens: record.usage.cache_miss_tokens,
+        cost_usd: record.provider_cost_usd.unwrap_or(0.0),
+    };
+    if !delta.cost_usd.is_finite() {
+        return Err("provider cost is not finite".into());
+    }
+    Ok(delta)
+}
+
+fn apply_attempt_buckets(
+    transaction: &WriteTransaction,
+    record: &AttemptRecord,
+    now_ms: i64,
+) -> Result<(), String> {
+    if record.started_at_ms < now_ms.saturating_sub(ROLLUP_RETENTION_MS) {
+        return Ok(());
+    }
+    let delta = attempt_delta(record)?;
+    let mut table = transaction
+        .open_table(ATTEMPT_ROLLUP_BUCKET)
+        .map_err(|error| error.to_string())?;
+    for (grain, unit) in [(GRAIN_MINUTE, MINUTE_MS), (GRAIN_HOUR, HOUR_MS)] {
+        let key = (
+            grain,
+            floor_to(record.started_at_ms, unit),
+            record.backend.as_str(),
+            record.upstream_model.as_str(),
+        );
+        let mut value = table
+            .get(key)
+            .map_err(|error| error.to_string())?
+            .map(|value| AttemptRollup::from(value.value()))
+            .unwrap_or_default();
+        value.checked_add_assign(delta)?;
+        table
+            .insert(key, AttemptRollupValue::from(value))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn bucket_ranges(from_ms: i64, to_ms: i64) -> [(u8, i64, i64); 3] {
+    let first_full_hour = ceil_to(from_ms, HOUR_MS);
+    let last_full_hour = floor_to(to_ms, HOUR_MS);
+    let left_end = first_full_hour.min(to_ms);
+    [
+        (GRAIN_MINUTE, from_ms, left_end),
+        (GRAIN_HOUR, first_full_hour, last_full_hour),
+        (GRAIN_MINUTE, last_full_hour.max(left_end), to_ms),
+    ]
 }
 
 fn add_bucket_range(
@@ -1645,6 +1813,209 @@ mod tests {
         let record = serde_json::from_value::<RequestRecord>(stored).unwrap();
         assert_eq!(record.fallback, Some(false));
         assert!(!record.fallback_exhausted);
+    }
+
+    #[test]
+    fn overview_windows_reconcile_all_models_and_frozen_attempt_costs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.ensure_stats_schema().unwrap();
+        let hour = floor_to(Utc::now().timestamp_millis(), HOUR_MS) - 5 * HOUR_MS;
+        // Left edge, full middle hour and right edge are disjoint; endpoints are [from,to).
+        for (index, minute) in [9, 10, 59, 60, 119, 120, 129, 130].into_iter().enumerate() {
+            let at = hour + minute * MINUTE_MS;
+            let mut request = request_record(&format!("r-{index}"), at);
+            request.served_model = match index % 3 {
+                0 => Some("served".into()),
+                1 => Some("deleted-model".into()),
+                _ => None,
+            };
+            request.fallback = Some(index == 1);
+            store.record_request(&request).unwrap();
+            store.record_request(&request).unwrap();
+            let mut attempt = attempt_record(&format!("a-{index}"), at);
+            attempt.backend = if index % 2 == 0 {
+                "provider"
+            } else {
+                "deleted-provider"
+            }
+            .into();
+            attempt.completed_at_ms = hour + 200 * MINUTE_MS; // Membership follows start, not end.
+            if index % 2 == 0 {
+                attempt.error_class = Some(crate::types::FailureClass::ProviderQuota);
+            }
+            attempt.provider_cost_usd = Some(0.125);
+            store.record_attempt(&attempt).unwrap();
+            store.record_attempt(&attempt).unwrap();
+        }
+        let from = hour + 10 * MINUTE_MS;
+        let to = hour + 130 * MINUTE_MS;
+        let result = store.overview_rollup_window(Some(from), Some(to)).unwrap();
+        assert_eq!(result.requests.calls, 6);
+        assert_eq!(result.requests.fallbacks, 1);
+        assert_eq!(result.requests.total_tokens, 78);
+        assert_eq!(result.attempts.len(), 2);
+        for value in result.attempts.values() {
+            assert_eq!(value.attempts, 3);
+            assert_eq!(value.cache_reported_attempts, 3);
+            assert_eq!(value.cache_hit_tokens, 12);
+            assert_eq!(value.cache_miss_tokens, 18);
+            assert_eq!(value.cost_usd, 0.375);
+        }
+        assert_eq!(
+            result.attempts[&("provider".into(), "upstream".into())].errors,
+            3
+        );
+        assert_eq!(
+            result.attempts[&("deleted-provider".into(), "upstream".into())].successes,
+            3
+        );
+        for (from, to, expected) in [(60, 120, 2), (10, 11, 1), (10, 10, 0), (0, 180, 8)] {
+            let result = store
+                .overview_rollup_window(Some(hour + from * MINUTE_MS), Some(hour + to * MINUTE_MS))
+                .unwrap();
+            assert_eq!(result.requests.calls, expected);
+            assert_eq!(
+                result.attempts.values().map(|v| v.attempts).sum::<u64>(),
+                expected
+            );
+        }
+        assert!(store.overview_rollup_window(Some(to), Some(from)).is_err());
+        assert!(store.overview_rollup_window(None, Some(to)).is_err());
+        assert_eq!(store.overview_rollup().unwrap().requests.calls, 8);
+        store.prune_stats(hour + 120 * MINUTE_MS).unwrap();
+        let pruned = store
+            .overview_rollup_window(Some(hour), Some(hour + 180 * MINUTE_MS))
+            .unwrap();
+        assert_eq!(pruned.requests.calls, 3);
+        assert_eq!(pruned.attempts.values().map(|v| v.attempts).sum::<u64>(), 3);
+        assert_eq!(store.overview_rollup().unwrap().requests.calls, 8);
+        assert_eq!(
+            store
+                .overview_rollup()
+                .unwrap()
+                .attempts
+                .values()
+                .map(|v| v.attempts)
+                .sum::<u64>(),
+            8
+        );
+    }
+
+    #[test]
+    fn day_window_excludes_old_rows_but_lifetime_and_reopen_preserve_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.ensure_stats_schema().unwrap();
+        let to = floor_to(Utc::now().timestamp_millis(), MINUTE_MS);
+        for (id, at) in [
+            ("old", to - 33 * 24 * HOUR_MS),
+            ("two-days", to - 48 * HOUR_MS),
+            ("today", to - MINUTE_MS),
+            ("current-minute", to),
+        ] {
+            store.record_request(&request_record(id, at)).unwrap();
+            store.record_attempt(&attempt_record(id, at)).unwrap();
+        }
+        drop(store);
+        let store = Store::open(dir.path()).unwrap();
+        store.ensure_stats_schema().unwrap();
+        store.ensure_stats_schema().unwrap();
+        let day = store
+            .overview_rollup_window(Some(to - 24 * HOUR_MS), Some(to))
+            .unwrap();
+        assert_eq!(day.requests.calls, 1);
+        assert_eq!(day.attempts.values().next().unwrap().attempts, 1);
+        assert_eq!(day.attempts.values().next().unwrap().cost_usd, 0.25);
+        let all = store.overview_rollup_window(None, None).unwrap();
+        assert_eq!(all.requests.calls, 4);
+        assert_eq!(all.attempts.values().next().unwrap().attempts, 4);
+        assert_eq!(all.attempts.values().next().unwrap().cost_usd, 1.0);
+    }
+
+    #[test]
+    fn existing_v1_attempt_bucket_migration_resumes_without_touching_lifetime_totals() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let at = floor_to(Utc::now().timestamp_millis(), MINUTE_MS) - MINUTE_MS;
+        let transaction = store.database.begin_write().unwrap();
+        // Simulate an existing v1 store: original all-time backfill is already ready.
+        for index in 0..=MIGRATION_BATCH_SIZE {
+            let record = attempt_record(&format!("legacy-{index:05}"), at);
+            let bytes = serde_json::to_vec(&record).unwrap();
+            transaction
+                .open_table(ATTEMPTS)
+                .unwrap()
+                .insert(record.id.as_str(), bytes.as_slice())
+                .unwrap();
+            apply_attempt_rollup(&transaction, &record).unwrap();
+        }
+        write_stats_meta(
+            &transaction,
+            &StatsMeta {
+                phase: StatsPhase::Ready,
+                ..StatsMeta::default()
+            },
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        assert!(
+            store
+                .record_attempt(&attempt_record("blocked", at))
+                .is_err()
+        );
+        assert!(
+            store
+                .record_request(&request_record("blocked", at))
+                .is_err()
+        );
+        let mut meta = AttemptBucketMeta::default();
+        store.backfill_attempt_buckets_batch(&mut meta).unwrap();
+        assert!(!meta.ready);
+        assert!(meta.cursor.is_some());
+        assert!(
+            store
+                .record_attempt(&attempt_record("still-blocked", at))
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .overview_rollup_window(Some(at), Some(at + MINUTE_MS))
+                .unwrap()
+                .attempts
+                .values()
+                .next()
+                .unwrap()
+                .attempts,
+            MIGRATION_BATCH_SIZE as u64
+        );
+        drop(store);
+        let store = Store::open(dir.path()).unwrap();
+        store.ensure_stats_schema().unwrap();
+        store.ensure_stats_schema().unwrap();
+        let count = (MIGRATION_BATCH_SIZE + 1) as u64;
+        let all = store.overview_rollup().unwrap();
+        let bounded = store
+            .overview_rollup_window(Some(at), Some(at + MINUTE_MS))
+            .unwrap();
+        assert_eq!(all.attempts.values().next().unwrap().attempts, count);
+        assert_eq!(bounded.attempts, all.attempts);
+        store
+            .record_attempt(&attempt_record("legacy-00000", at))
+            .unwrap();
+        store.record_attempt(&attempt_record("new", at)).unwrap();
+        assert_eq!(
+            store
+                .overview_rollup_window(Some(at), Some(at + MINUTE_MS))
+                .unwrap()
+                .attempts
+                .values()
+                .next()
+                .unwrap()
+                .attempts,
+            count + 1
+        );
+        assert_eq!(store.attempts(2000).unwrap().len(), count as usize + 1);
     }
 
     fn request_record(id: &str, started_at_ms: i64) -> RequestRecord {

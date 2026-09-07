@@ -821,3 +821,78 @@ async fn shared_upstream_models_have_separate_history_pages_and_statistics() {
         .unwrap();
     assert_eq!(stats["requests"]["total"], 10);
 }
+
+#[tokio::test]
+async fn global_statistics_accept_windows_and_preserve_omitted_lifetime_behavior() {
+    let app = App::new(|_| {}).await;
+    app.route("public", "primary").await;
+    let omitted: Value = app
+        .client
+        .get(format!("{}/api/stats", app.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let explicit: Value = app
+        .client
+        .get(format!("{}/api/stats?window=all", app.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(omitted, explicit);
+    assert_eq!(omitted["requests"]["total"], 1);
+    assert_eq!(
+        omitted["window"],
+        json!({"id":"All","from_ms":null,"to_ms":null})
+    );
+    for (window, duration) in [
+        ("1h", 60),
+        ("1d", 24 * 60),
+        ("1w", 7 * 24 * 60),
+        ("1m", 30 * 24 * 60),
+    ] {
+        let response = app
+            .client
+            .get(format!("{}/api/stats?window={window}", app.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let stats: Value = response.json().await.unwrap();
+        let from = stats["window"]["from_ms"].as_i64().unwrap();
+        let to = stats["window"]["to_ms"].as_i64().unwrap();
+        assert_eq!(to % 60_000, 0);
+        assert_eq!(to - from, duration * 60_000);
+        assert_eq!(stats["window"]["id"], window.to_uppercase());
+        let model: Value = app
+            .client
+            .get(format!(
+                "{}/api/routing/stats?model=public&window={window}",
+                app.url
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        // Both endpoints use the same time partition and completed-minute policy.
+        if model["window"] == stats["window"] {
+            assert_eq!(model["totals"]["calls"], stats["requests"]["total"]);
+        }
+    }
+    for invalid in ["invalid", "", "2d"] {
+        let response = app
+            .client
+            .get(format!("{}/api/stats?window={invalid}", app.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+}

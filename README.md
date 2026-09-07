@@ -83,8 +83,11 @@ curl http://127.0.0.1:8080/healthz
 
 The API and Routing workspace are available at <http://127.0.0.1:8080>. Compose
 mounts the private `data/routing` directory for validated configuration saves and
-stores the request ledger in a named volume. Click Enable edit to change settings.
-Save validates changed upstream bindings,
+stores the request ledger in a named volume. The initial page is All Statistics
+for 1 day; selecting a model also opens its Statistics for 1 day. Accounts is a
+separate page sharing the workspace draft. Click Enable edit to change settings.
+Each deletion requires confirmation before changing the draft. Save asks for
+confirmation of all pending updates, validates changed upstream bindings,
 persists readable TOML and immediately activates new requests. Existing requests
 finish on their captured routing revision.
 
@@ -560,15 +563,20 @@ interface.
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /` | Unified Routing workspace with inline editing, accounts, statistics and history. |
+| `GET /` | All Statistics by default, model-scoped views, and a separate Accounts page. |
 | `GET /healthz` | Health, served models, and uptime. |
 | `GET /api/status` | Configuration summary, target circuits, affinity state, and alerts. |
-| `GET /api/stats` | Aggregate request, backend, model, token, and cost totals. |
+| `GET /api/stats?window=1d` | Aggregate request, account, token and recorded cost totals for `1h`, `1d`, `1w`, `1m`, or `all`; omission preserves lifetime totals. |
 | `PUT /api/routing` | Validate, persist and activate a routing document; requires the current base revision. |
 | `GET /api/routing` | Served models, ordered layers, targets, and circuit state. |
 | `GET /api/routing/stats?model=NAME&window=1d` | Target/key routing totals for `1h`, `1d`, `1w`, `1m`, or `all`. |
 | `GET /api/requests?limit=20&before=CURSOR` | Cursor-paginated logical request records; optional `model=NAME` filters before pagination. |
 | `GET /api/attempts?limit=100` | Recent per-target attempts. |
+
+Finite statistics ranges are rolling intervals ending at the last completed
+minute. Current account/credential alerts remain on All, independent of the
+statistics interval. Model statistics show No final target only for nonzero
+requests lacking a recorded final layer/target.
 
 Request and attempt limits have a maximum of 1000. Routing statistics attribute
 one logical request to its final recorded target; failed intermediate targets
