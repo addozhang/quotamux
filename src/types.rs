@@ -39,6 +39,7 @@ pub enum FailureClass {
     ProviderUnknown5xxOrTransport,
     ClientCancelled,
     FallbackUnavailable,
+    LocalCapacity,
 }
 
 impl FailureClass {
@@ -57,6 +58,7 @@ impl FailureClass {
             Self::ProviderUnknown5xxOrTransport => "provider_unknown_5xx_or_transport",
             Self::ClientCancelled => "client_cancelled",
             Self::FallbackUnavailable => "fallback_unavailable",
+            Self::LocalCapacity => "local_capacity",
         }
     }
 
@@ -71,7 +73,10 @@ impl FailureClass {
     pub const fn affects_circuit(self) -> bool {
         !matches!(
             self,
-            Self::ClientRequest | Self::ClientCancelled | Self::ProviderAmbiguousRejection
+            Self::ClientRequest
+                | Self::ClientCancelled
+                | Self::ProviderAmbiguousRejection
+                | Self::LocalCapacity
         )
     }
 }

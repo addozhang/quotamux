@@ -10,7 +10,7 @@ When the selected upstream uses another supported protocol, QuotaMux translates
 the request and response at the protocol boundary.
 
 > [!IMPORTANT]
-> QuotaMux does not authenticate inbound clients. Bind it to localhost, keep it
+> QuotaMux does not authenticate inference clients. Bind it to localhost, keep it
 > on a private network, or place it behind an authenticated reverse proxy. The
 > included Compose configuration publishes only on `127.0.0.1`.
 
@@ -62,7 +62,8 @@ served model
                  └─ adapter
 ```
 
-Configuration uses TOML and requires `config_version = 3`. Array entries belong
+Configuration uses readable TOML with `config_version = 4`. Existing version 3
+configuration is automatically migrated without changing routing behavior. Array entries belong
 to their closest preceding parent: `[[backends.credentials]]` and
 `[[backends.models]]` belong to the preceding `[[backends]]`, while
 `[[models.layers]]` belongs to the preceding `[[models]]`.
@@ -70,15 +71,35 @@ to their closest preceding parent: `[[backends.credentials]]` and
 ## Quick start
 
 ```sh
-cp quotamux.example.toml quotamux.toml
+mkdir -p data/routing
+chmod 700 data/routing
+cp quotamux.example.toml data/routing/quotamux.toml
 # Add the API keys required by your routes.
-cargo run --bin quotamux -- --check
+chmod 600 data/routing/quotamux.toml
+cargo run --bin quotamux -- --config data/routing/quotamux.toml --check
 docker compose up --build -d
 curl http://127.0.0.1:8080/healthz
 ```
 
-The API and dashboard are available at <http://127.0.0.1:8080>. Compose mounts
-`quotamux.toml` read-only and stores operational data in a named volume.
+The API and Routing workspace are available at <http://127.0.0.1:8080>. Compose
+mounts the private `data/routing` directory for validated configuration saves and
+stores the request ledger in a named volume. Click Enable edit to change settings.
+Save validates changed upstream bindings,
+persists readable TOML and immediately activates new requests. Existing requests
+finish on their captured routing revision.
+
+For an existing installation, copy the current `quotamux.toml` into `data/routing`
+instead of copying the example. Version 3 migrates to version 4 at startup,
+retaining the exact original document in a private `quotamux.toml.v3.bak` file.
+The migration preserves model names, aliases, target order, credentials, protocol
+and pricing settings. It adds no time windows or capacity limits. Read-only
+configurations can still run using the migrated in-memory document; the workspace
+shows when migration persistence needs a writable directory. Unknown schemas or
+invalid references reject startup before a configuration rewrite.
+
+Run development and E2E on isolated 8081 data. Promotion to production 8080 requires
+the automated and browser acceptance gates described in
+[Routing workspace](docs/routing-workspace.md).
 
 Useful commands:
 
@@ -105,7 +126,7 @@ Official pay-as-you-go capacity second. The public model supports all three
 ingress protocols even though each target may use a different native protocol.
 
 ```toml
-config_version = 3
+config_version = 4
 
 [server]
 listen = "0.0.0.0:8080"
@@ -310,9 +331,31 @@ QuotaMux combines them with upstream-reported usage. If pricing is absent,
 usage is recorded without an estimated cost. No model price is built into the
 binary; configure the provider's current prices yourself.
 
-DeepSeek V4 pricing changes by time of day. The example configuration uses the
-current off-peak USD rates; peak rates are twice those values, so QuotaMux's
-static cost field remains an estimate rather than a billing statement.
+Add `pricing_schedule` to select rates by the provider's weekly calendar:
+
+```toml
+pricing_note = "Published usage rates; subscription allowance value is not a cash invoice."
+pricing_source = "https://ollama.com/pricing"
+[backends.models.pricing_schedule]
+timezone = "UTC"
+[[backends.models.pricing_schedule.windows]]
+name = "Weekday peak"
+days = [1, 2, 3, 4, 5]
+start = "12:00"
+end = "18:00"
+pricing = { cache_hit_input_usd_per_million = 0.014, cache_miss_input_usd_per_million = 0.44, output_usd_per_million = 1.32 }
+```
+
+Put these fields in the relevant `[[backends.models]]` table after its default
+`pricing`. Windows require default rates and follow the same timezone, weekday,
+inclusive-start/exclusive-end and overlap rules as routing schedules. Pricing
+and routing have independent calendars in the same configuration document.
+Each upstream attempt captures its start-time price, including streams that
+finish after a boundary or a configuration save. Historical estimates retain
+their recorded values. Providers publishing points or membership allowances
+without USD token rates should use notes and leave `pricing` absent.
+See [the researched Flash configuration](docs/flash-routing-plan.md) for provider
+rates, billing context and the scheduled route.
 
 ## Served models
 
@@ -517,13 +560,14 @@ interface.
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /` | Local dashboard. |
+| `GET /` | Unified Routing workspace with inline editing, accounts, statistics and history. |
 | `GET /healthz` | Health, served models, and uptime. |
 | `GET /api/status` | Configuration summary, target circuits, affinity state, and alerts. |
 | `GET /api/stats` | Aggregate request, backend, model, token, and cost totals. |
+| `PUT /api/routing` | Validate, persist and activate a routing document; requires the current base revision. |
 | `GET /api/routing` | Served models, ordered layers, targets, and circuit state. |
 | `GET /api/routing/stats?model=NAME&window=1d` | Target/key routing totals for `1h`, `1d`, `1w`, `1m`, or `all`. |
-| `GET /api/requests?limit=20&before=CURSOR` | Cursor-paginated logical request records. |
+| `GET /api/requests?limit=20&before=CURSOR` | Cursor-paginated logical request records; optional `model=NAME` filters before pagination. |
 | `GET /api/attempts?limit=100` | Recent per-target attempts. |
 
 Request and attempt limits have a maximum of 1000. Routing statistics attribute
@@ -571,13 +615,20 @@ npm --prefix frontend ci
 npm --prefix frontend run build
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets --all-features
+cargo test --locked --all-targets --all-features -- --test-threads=1
 ```
 
-Run a credential-free smoke test against a live instance:
+Run browser E2E (launches an isolated mock-backed 8081 instance):
 
 ```sh
-cargo run --bin quotamux-smoke -- --base-url http://127.0.0.1:8080
+cargo build --locked --bins
+npm --prefix frontend run test:e2e
+```
+
+Run a credential-free smoke test against an isolated live instance:
+
+```sh
+cargo run --bin quotamux-smoke -- --base-url http://127.0.0.1:8081
 ```
 
 The container build uses Rust 1.97, builds the frontend, embeds its compressed
@@ -585,6 +636,8 @@ assets in the binary, and runs as an unprivileged user in a read-only scratch
 image.
 
 ## Design documents
+
+- [Routing workspace, scheduling, live saves and acceptance](docs/routing-workspace.md)
 
 - [Routing architecture](docs/routing-architecture-v3.md)
 - [Prompt-prefix affinity](docs/prompt-prefix-affinity.md)

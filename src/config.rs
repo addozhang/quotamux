@@ -21,18 +21,31 @@ const fn default_max_inference_body_bytes() -> usize {
     DEFAULT_MAX_INFERENCE_BODY_BYTES
 }
 
-#[derive(Clone, Debug, Deserialize)]
+fn default_timezone() -> String {
+    "UTC".into()
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapacityPool {
+    pub id: String,
+    pub max_in_flight: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub config_version: u32,
     pub server: ServerConfig,
     #[serde(default)]
     pub affinity: PrefixAffinityConfig,
+    #[serde(default)]
+    pub capacity_pools: Vec<CapacityPool>,
     pub backends: Vec<BackendConfig>,
     pub models: Vec<ServedModelConfig>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub listen: String,
@@ -147,7 +160,7 @@ impl AdapterKind {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackendConfig {
     pub id: String,
@@ -170,14 +183,16 @@ impl BackendConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CredentialConfig {
     pub id: String,
     pub api_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackendModelConfig {
     pub name: String,
@@ -185,9 +200,15 @@ pub struct BackendModelConfig {
     pub protocols: Vec<Protocol>,
     #[serde(default)]
     pub pricing: Option<ModelPricingConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_schedule: Option<crate::pricing::PricingSchedule>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_source: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ModelPricingConfig {
     pub cache_hit_input_usd_per_million: f64,
@@ -195,7 +216,7 @@ pub struct ModelPricingConfig {
     pub output_usd_per_million: f64,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServedModelConfig {
     pub name: String,
@@ -203,6 +224,10 @@ pub struct ServedModelConfig {
     pub aliases: Vec<String>,
     pub protocols: Vec<Protocol>,
     pub layers: Vec<RouteLayerConfig>,
+    #[serde(default = "default_timezone")]
+    pub timezone: String,
+    #[serde(default)]
+    pub schedules: Vec<crate::calendar::Schedule>,
 }
 
 impl ServedModelConfig {
@@ -211,7 +236,7 @@ impl ServedModelConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum RouteStrategy {
     Random,
@@ -227,7 +252,7 @@ impl RouteStrategy {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteLayerConfig {
     pub name: String,
@@ -235,7 +260,7 @@ pub struct RouteLayerConfig {
     pub targets: Vec<RouteTargetConfig>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, Hash, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RouteTargetConfig {
     pub backend: String,
@@ -277,21 +302,37 @@ impl Config {
             }
         })?;
 
+        config.upgrade()?;
+        Ok(config.for_runtime(path))
+    }
+
+    /// Version 3 is the supported 0.1 configuration. Defaults are supplied by
+    /// serde; the migration preserves all original business routing fields.
+    pub fn upgrade(&mut self) -> Result<bool, ConfigError> {
+        self.validate()?;
+        let changed = self.config_version == 3;
+        self.config_version = 4;
+        Ok(changed)
+    }
+
+    pub(crate) fn for_runtime(&self, path: &Path) -> Self {
+        let mut config = self.clone();
         if config.server.data_dir.is_relative() {
-            let parent = path.parent().unwrap_or_else(|| Path::new("."));
-            config.server.data_dir = parent.join(&config.server.data_dir);
+            config.server.data_dir = path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(&config.server.data_dir);
         }
         if let Some(data_dir) = env::var_os("QUOTAMUX_DATA_DIR") {
             config.server.data_dir = PathBuf::from(data_dir);
         }
-        config.validate()?;
-        Ok(config)
+        config
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.config_version != 3 {
+        if !matches!(self.config_version, 3 | 4) {
             return Err(invalid(format!(
-                "unsupported config_version {}; expected 3",
+                "unsupported config_version {}; expected 3 or 4",
                 self.config_version
             )));
         }
@@ -311,6 +352,28 @@ impl Config {
         }
         self.affinity.validate().map_err(invalid)?;
 
+        let mut pools = HashSet::new();
+        for pool in &self.capacity_pools {
+            validate_id("capacity_pools.id", &pool.id)?;
+            if pool.max_in_flight == 0 || !pools.insert(pool.id.as_str()) {
+                return Err(invalid(
+                    "capacity pools require unique IDs and positive limits",
+                ));
+            }
+        }
+        for credential in self
+            .backends
+            .iter()
+            .flat_map(|backend| &backend.credentials)
+        {
+            if credential
+                .pool
+                .as_deref()
+                .is_some_and(|pool| !pools.contains(pool))
+            {
+                return Err(invalid("credential references an unknown capacity pool"));
+            }
+        }
         let mut backend_ids = HashSet::new();
         for (backend_index, backend) in self.backends.iter().enumerate() {
             let path = format!("backends[{backend_index}]");
@@ -353,6 +416,16 @@ impl Config {
             if model.layers.is_empty() {
                 return Err(invalid(format!("{path}.layers must not be empty")));
             }
+            crate::calendar::validate(
+                &model.timezone,
+                &model
+                    .layers
+                    .iter()
+                    .map(|layer| layer.name.clone())
+                    .collect::<Vec<_>>(),
+                &model.schedules,
+            )
+            .map_err(invalid)?;
             let mut layer_names = HashSet::new();
             for (layer_index, layer) in model.layers.iter().enumerate() {
                 let layer_path = format!("{path}.layers[{layer_index}]");
@@ -511,6 +584,8 @@ fn validate_backend(path: &str, backend: &BackendConfig) -> Result<(), ConfigErr
                 }
             }
         }
+        crate::pricing::Tariff::new(model)
+            .map_err(|error| invalid(format!("{model_path}.pricing_schedule: {error}")))?;
     }
     Ok(())
 }
@@ -586,6 +661,7 @@ mod tests {
 
     pub fn valid() -> Config {
         Config {
+            capacity_pools: vec![],
             config_version: 3,
             server: ServerConfig {
                 listen: "127.0.0.1:8080".into(),
@@ -600,6 +676,7 @@ mod tests {
                     adapter: AdapterKind::OpenCodeGo,
                     endpoint: None,
                     credentials: vec![CredentialConfig {
+                        pool: None,
                         id: "go-plan".into(),
                         api_key: "x".into(),
                     }],
@@ -607,6 +684,7 @@ mod tests {
                         name: UPSTREAM_MODEL.into(),
                         protocols: Vec::new(),
                         pricing: None,
+                        ..Default::default()
                     }],
                 },
                 BackendConfig {
@@ -614,6 +692,7 @@ mod tests {
                     adapter: AdapterKind::DeepSeekOfficial,
                     endpoint: None,
                     credentials: vec![CredentialConfig {
+                        pool: None,
                         id: "deepseek-payg".into(),
                         api_key: "y".into(),
                     }],
@@ -625,10 +704,13 @@ mod tests {
                             Protocol::AnthropicMessages,
                         ],
                         pricing: None,
+                        ..Default::default()
                     }],
                 },
             ],
             models: vec![ServedModelConfig {
+                timezone: "UTC".into(),
+                schedules: vec![],
                 name: LOGICAL_MODEL.into(),
                 aliases: vec![UPSTREAM_MODEL.into()],
                 protocols: vec![
@@ -778,11 +860,7 @@ data_dir = "data"
 
     #[test]
     fn recognized_but_unimplemented_adapters_are_rejected() {
-        for adapter in [
-            AdapterKind::AliyunBailian,
-            AdapterKind::OllamaCloud,
-            AdapterKind::OpenCodeZen,
-        ] {
+        for adapter in [AdapterKind::AliyunBailian, AdapterKind::OpenCodeZen] {
             let mut config = valid();
             config.backends[0].adapter = adapter;
             let error = config.validate().unwrap_err().to_string();

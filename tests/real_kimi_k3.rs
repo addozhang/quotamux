@@ -185,6 +185,8 @@ async fn start_single_target(
         timeouts: config.server.timeouts,
     };
     config.models = vec![ServedModelConfig {
+        timezone: "UTC".into(),
+        schedules: vec![],
         name: PROBE_MODEL.into(),
         aliases: Vec::new(),
         protocols: vec![Protocol::OpenAiChat],

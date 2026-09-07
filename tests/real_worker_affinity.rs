@@ -155,6 +155,8 @@ fn real_probe_config(path: &PathBuf, data_dir: &TempDir) -> (Config, String) {
         timeouts: config.server.timeouts,
     };
     config.models = vec![ServedModelConfig {
+        timezone: "UTC".into(),
+        schedules: vec![],
         name: served_model.clone(),
         aliases: Vec::new(),
         protocols: vec![Protocol::OpenAiChat],
@@ -207,6 +209,7 @@ fn legacy_v1_config(document: &toml::Value) -> Config {
         ),
     ];
     Config {
+        capacity_pools: vec![],
         config_version: 3,
         server: ServerConfig {
             listen: "127.0.0.1:0".into(),
@@ -217,6 +220,8 @@ fn legacy_v1_config(document: &toml::Value) -> Config {
         affinity: Default::default(),
         backends,
         models: vec![ServedModelConfig {
+            timezone: "UTC".into(),
+            schedules: vec![],
             name: logical_name,
             aliases: Vec::new(),
             protocols: vec![Protocol::OpenAiChat],
@@ -278,6 +283,7 @@ fn legacy_provider(
         adapter: kind,
         endpoint: None,
         credentials: vec![CredentialConfig {
+            pool: None,
             id: format!("{id}-real"),
             api_key: text_at(document, &["providers", legacy_id, "api_key"]),
         }],
@@ -289,6 +295,7 @@ fn legacy_provider(
                 vec![Protocol::OpenAiChat]
             },
             pricing: None,
+            ..Default::default()
         }],
     }
 }

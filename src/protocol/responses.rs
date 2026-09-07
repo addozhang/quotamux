@@ -473,6 +473,16 @@ fn copy_field(
     }
 }
 
+fn reasoning_fragment(message: &Value) -> Option<&str> {
+    let nonempty = |key| {
+        message
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+    };
+    nonempty("reasoning_content").or_else(|| nonempty("reasoning"))
+}
+
 pub fn chat_to_response(chat: &Value, response_model: &str, request: &Value) -> Value {
     let id = chat
         .get("id")
@@ -487,11 +497,7 @@ pub fn chat_to_response(chat: &Value, response_model: &str, request: &Value) -> 
         .unwrap_or(Value::Null);
     let message = choice.get("message").cloned().unwrap_or(Value::Null);
     let mut output = Vec::new();
-    if let Some(reasoning) = message
-        .get("reasoning_content")
-        .and_then(Value::as_str)
-        .filter(|v| !v.is_empty())
-    {
+    if let Some(reasoning) = reasoning_fragment(&message) {
         output.push(json!({"type":"reasoning","id":format!("rs_{}", Uuid::now_v7()),"status":"completed","summary":[],"content":[{"type":"reasoning_text","text":reasoning}]}));
     }
     if let Some(content) = message
@@ -661,11 +667,7 @@ impl ChatToResponsesStream {
             .flatten()
         {
             let delta = choice.get("delta").unwrap_or(&Value::Null);
-            if let Some(reasoning) = delta
-                .get("reasoning_content")
-                .and_then(Value::as_str)
-                .filter(|v| !v.is_empty())
-            {
+            if let Some(reasoning) = reasoning_fragment(delta) {
                 let item_id = self.ensure_reasoning(&mut events);
                 self.reasoning.push_str(reasoning);
                 events.push(self.event(
@@ -938,6 +940,50 @@ impl ResponsesToChatStream {
 mod tests {
     use super::*;
     use crate::config::LOGICAL_MODEL;
+
+    #[test]
+    fn translates_reasoning_alias_without_merging_fields() {
+        for (message, wanted) in [
+            (json!({"reasoning":"cloud"}), "cloud"),
+            (
+                json!({"reasoning_content":"primary","reasoning":"cloud"}),
+                "primary",
+            ),
+            (json!({"reasoning_content":"","reasoning":"cloud"}), "cloud"),
+            (
+                json!({"reasoning_content":false,"reasoning":"cloud"}),
+                "cloud",
+            ),
+            (json!({"reasoning_content":[],"reasoning":{}}), ""),
+            (json!({"reasoning":""}), ""),
+        ] {
+            let response = chat_to_response(
+                &json!({"choices":[{"message":message.clone()}]}),
+                "served",
+                &json!({}),
+            );
+            let items = response["output"].as_array().unwrap();
+            assert_eq!(items.len(), usize::from(!wanted.is_empty()));
+            if !wanted.is_empty() {
+                assert_eq!(items[0]["content"][0]["text"], wanted);
+            }
+            let mut stream = ChatToResponsesStream::new("served", json!({}));
+            let events = stream.translate(&json!({"choices":[{"delta":message}]}));
+            let emitted: Vec<_> = events
+                .iter()
+                .filter(|event| event.event.as_deref() == Some("response.reasoning_text.delta"))
+                .map(|event| {
+                    serde_json::from_str::<Value>(&event.data).unwrap()["delta"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect();
+            assert_eq!(emitted.concat(), wanted);
+            assert_eq!(emitted.len(), usize::from(!wanted.is_empty()));
+            assert_eq!(stream.reasoning, wanted);
+        }
+    }
 
     #[test]
     fn translates_response_tools_and_reasoning_to_chat() {

@@ -344,6 +344,55 @@ impl Store {
         })
     }
 
+    pub fn request_page_for_model(
+        &self,
+        limit: usize,
+        before: Option<&str>,
+        model_names: &[&str],
+    ) -> Result<RequestPage, String> {
+        let mut page = RequestPage {
+            requests: Vec::new(),
+            next_cursor: None,
+        };
+        if limit == 0 || model_names.is_empty() {
+            return Ok(page);
+        }
+        let transaction = self
+            .database
+            .begin_read()
+            .map_err(|error| error.to_string())?;
+        let table = transaction
+            .open_table(REQUESTS)
+            .map_err(|error| error.to_string())?;
+        let entries = if let Some(before) = before {
+            table
+                .range::<&str>((Unbounded, Excluded(before)))
+                .map_err(|error| error.to_string())?
+        } else {
+            table.iter().map_err(|error| error.to_string())?
+        };
+        let mut last_key = None;
+        for entry in entries.rev() {
+            let (key, value) = entry.map_err(|error| error.to_string())?;
+            let record: RequestRecord =
+                serde_json::from_slice(value.value()).map_err(|error| error.to_string())?;
+            let model = record
+                .served_model
+                .as_deref()
+                .unwrap_or(&record.requested_model);
+            if !model_names.contains(&model) {
+                continue;
+            }
+            if page.requests.len() == limit {
+                page.next_cursor = last_key;
+                break;
+            }
+            last_key = Some(key.value().to_owned());
+            page.requests.push(record);
+        }
+        Ok(page)
+    }
+
     pub fn attempts(&self, limit: usize) -> Result<Vec<AttemptRecord>, String> {
         self.list(ATTEMPTS, limit)
     }
@@ -1528,6 +1577,59 @@ mod tests {
             ["0001"]
         );
         assert_eq!(last.next_cursor, None);
+    }
+
+    #[test]
+    fn model_pages_scan_interleaved_rows_before_paginating() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        for (id, served, requested) in [
+            ("01", None, "alias"),
+            ("02", Some("other"), "alias"),
+            ("03", Some("served"), "unrelated-request-name"),
+            ("04", None, "other"),
+            ("05", Some("other"), "served"),
+            ("06", None, "served"),
+            ("07", Some("other"), "other"),
+            ("08", Some("other"), "other"),
+            ("09", Some("served"), "alias"),
+            ("10", Some("other"), "other"),
+        ] {
+            let mut record = request_record(id, Utc::now().timestamp_millis());
+            record.served_model = served.map(str::to_owned);
+            record.requested_model = requested.into();
+            store.put(REQUESTS, id, &record).unwrap();
+        }
+        let names = ["served", "alias"];
+        let ids = |page: &RequestPage| {
+            page.requests
+                .iter()
+                .map(|r| r.id.clone())
+                .collect::<Vec<_>>()
+        };
+        let first = store.request_page_for_model(2, None, &names).unwrap();
+        assert_eq!(ids(&first), ["09", "06"]);
+        assert_eq!(first.next_cursor.as_deref(), Some("06"));
+        let second = store
+            .request_page_for_model(2, first.next_cursor.as_deref(), &names)
+            .unwrap();
+        assert_eq!(ids(&second), ["03", "01"]);
+        assert!(second.next_cursor.is_none());
+        let last = store.request_page_for_model(2, Some("03"), &names).unwrap();
+        assert_eq!(ids(&last), ["01"]);
+        assert!(last.next_cursor.is_none());
+        let all = store.request_page(2, None).unwrap();
+        assert_eq!(ids(&all), ["10", "09"]);
+        assert_eq!(all.next_cursor.as_deref(), Some("09"));
+        for page in [
+            store.request_page_for_model(0, None, &names).unwrap(),
+            store.request_page_for_model(2, None, &[]).unwrap(),
+            store.request_page_for_model(2, None, &["absent"]).unwrap(),
+            store.request_page_for_model(2, Some("01"), &names).unwrap(),
+        ] {
+            assert!(page.requests.is_empty());
+            assert!(page.next_cursor.is_none());
+        }
     }
 
     #[test]

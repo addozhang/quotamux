@@ -1,69 +1,14 @@
 <!doctype html>
 <html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="color-scheme" content="dark">
-  <title>QuotaMux</title>
-  <link rel="stylesheet" href="/src/styles.css">
-</head>
-<body>
-  <div class="shell">
-    <header class="topbar">
-      <div class="brand">QuotaMux</div>
-      <nav class="nav" aria-label="Primary">
-        <button type="button" data-view="overview" aria-selected="true">Overview</button>
-        <button type="button" data-view="routing" aria-selected="false">Routing</button>
-      </nav>
-    </header>
-    <main>
-      <div id="error" class="error" role="alert" hidden></div>
-      <div id="overview-view">
-        <div class="page-heading"><div><p class="eyebrow">Gateway</p><h1>Overview</h1></div></div>
-        <section class="grid" id="summary-cards" aria-label="Request totals"></section>
-        <section>
-          <div class="section-heading"><h2>Backends</h2></div>
-          <div class="scroll"><table><caption>Backend attempt totals</caption><thead><tr><th scope="col">Backend</th><th scope="col">Served models</th><th scope="col">Upstream models</th><th scope="col" class="numeric">Attempts</th><th scope="col" class="numeric">Success</th><th scope="col" class="numeric">Errors</th><th scope="col" class="numeric">Cache hit</th><th scope="col" class="numeric">Cost estimate</th></tr></thead><tbody id="backend-rows"></tbody></table></div>
-        </section>
-        <section>
-          <div class="section-heading">
-            <h2>Recent requests</h2>
-            <nav class="pagination" aria-label="Recent requests pages">
-              <span id="request-page" class="page-label" aria-live="polite">Page 1</span>
-              <button type="button" id="request-newer" disabled>Newer</button>
-              <button type="button" id="request-older" disabled>Older</button>
-            </nav>
-          </div>
-          <div class="scroll request-scroll"><table class="request-table"><caption>Most recent logical requests</caption><colgroup><col class="request-time"><col class="request-model"><col class="request-layer"><col class="request-target"><col class="request-result"><col class="request-latency"><col class="request-tokens"></colgroup><thead><tr><th scope="col">Time</th><th scope="col">Model</th><th scope="col">Layer</th><th scope="col">Target</th><th scope="col">Result</th><th scope="col" class="numeric">Latency</th><th scope="col" class="numeric">Tokens</th></tr></thead><tbody id="request-rows"></tbody></table></div>
-        </section>
-        <section>
-          <div class="section-heading"><h2>Active alerts</h2></div>
-          <div class="scroll"><table><caption>Active target alerts</caption><thead><tr><th scope="col">Backend</th><th scope="col">Key</th><th scope="col">Class</th><th scope="col">Last seen</th><th scope="col">Next probe</th></tr></thead><tbody id="alert-rows"></tbody></table></div>
-        </section>
-      </div>
-      <div id="routing-view" hidden>
-        <div class="page-heading"><div><p class="eyebrow">Served model</p><h1 id="routing-title">Routing</h1></div></div>
-        <div class="toolbar">
-          <div id="model-control"></div>
-          <div class="route-tabs" role="tablist" aria-label="Routing view">
-            <button type="button" data-route-view="structure" role="tab" aria-selected="true">Structure</button>
-            <button type="button" data-route-view="statistics" role="tab" aria-selected="false">Statistics</button>
-          </div>
-        </div>
-        <div id="structure-panel" role="tabpanel">
-          <div class="scroll"><table><caption>Configured routing layers and targets</caption><thead><tr><th scope="col">Layer</th><th scope="col">Strategy</th><th scope="col">Backend</th><th scope="col">Key</th><th scope="col">Upstream model</th><th scope="col">Circuit</th><th scope="col">Reason</th><th scope="col">Next probe</th></tr></thead><tbody id="structure-rows"></tbody></table></div>
-        </div>
-        <div id="statistics-panel" role="tabpanel" hidden>
-          <div class="toolbar">
-            <div class="segments" id="window-control" aria-label="Statistics window"></div>
-            <div class="segments" id="metric-control" aria-label="Statistics metric"></div>
-          </div>
-          <div class="section-heading"><h2 id="stats-period">Statistics</h2><div class="stats-total"><span class="label">Model total</span><span class="value" id="stats-total">—</span></div></div>
-          <div class="scroll"><table><caption>Request totals by routing target</caption><thead><tr><th scope="col">Entry</th><th scope="col">Layer</th><th scope="col">Backend</th><th scope="col">Key</th><th scope="col">Upstream model</th><th scope="col" class="numeric" id="metric-heading">Calls</th></tr></thead><tbody id="statistics-rows"></tbody></table></div>
-        </div>
-      </div>
-    </main>
-  </div>
-  <script type="module" src="/src/main.js"></script>
-</body>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>QuotaMux · Routing</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+    <link rel="icon" href="data:," />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
 </html>

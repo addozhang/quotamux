@@ -40,6 +40,7 @@ pub struct BackendClient {
     model: String,
     protocols: Vec<Protocol>,
     pricing: Option<ModelPricingConfig>,
+    tariff: crate::pricing::Tariff,
     client: reqwest::Client,
     stream_client: reqwest::Client,
 }
@@ -62,6 +63,8 @@ pub enum BackendBuildError {
     MissingEndpoint(String),
     #[error("custom backend {0} endpoint is not an absolute HTTP(S) URL")]
     InvalidEndpoint(String),
+    #[error("backend {0} has invalid usage pricing")]
+    InvalidPricing(String),
     #[error("backend {backend} has no protocol contract for model {model}")]
     UnknownModel { backend: String, model: String },
     #[error("backend {backend} model {model} has no validated protocols")]
@@ -89,7 +92,6 @@ impl BackendClient {
         )
     }
 
-    #[cfg(not(feature = "test-support"))]
     pub(crate) fn new_with_timeouts(
         backend: &BackendConfig,
         credential: &CredentialConfig,
@@ -175,6 +177,8 @@ impl BackendClient {
             model: model.name.clone(),
             protocols,
             pricing: model.pricing,
+            tariff: crate::pricing::Tariff::new(model)
+                .map_err(|_| BackendBuildError::InvalidPricing(backend.id.clone()))?,
             client,
             stream_client,
         })
@@ -200,6 +204,9 @@ impl BackendClient {
     }
     pub const fn pricing(&self) -> Option<&ModelPricingConfig> {
         self.pricing.as_ref()
+    }
+    pub fn pricing_at(&self, at: chrono::DateTime<chrono::Utc>) -> Option<ModelPricingConfig> {
+        self.tariff.at(at).1
     }
     pub fn protocol_for(&self, ingress: Protocol) -> Protocol {
         if self.protocols.contains(&ingress) {
@@ -459,6 +466,7 @@ mod tests {
             adapter: kind,
             endpoint: None,
             credentials: vec![CredentialConfig {
+                pool: None,
                 id: "test-key".into(),
                 api_key: "secret".into(),
             }],
@@ -470,6 +478,7 @@ mod tests {
                     vec![Protocol::OpenAiChat]
                 },
                 pricing: None,
+                ..Default::default()
             }],
         };
         BackendClient::new(&backend, &backend.credentials[0], &backend.models[0]).unwrap()
@@ -612,6 +621,7 @@ mod tests {
             adapter: AdapterKind::CustomChatCompletions,
             endpoint: Some("https://customer.example/private/inference".into()),
             credentials: vec![CredentialConfig {
+                pool: None,
                 id: "customer-key".into(),
                 api_key: "secret".into(),
             }],
@@ -619,6 +629,7 @@ mod tests {
                 name: "customer-model".into(),
                 protocols: vec![Protocol::OpenAiChat],
                 pricing: None,
+                ..Default::default()
             }],
         };
         let client =
@@ -642,9 +653,10 @@ mod tests {
     fn public_client_constructor_rejects_unvalidated_backend_shapes_without_panicking() {
         let mut backend = BackendConfig {
             id: "bad".into(),
-            adapter: AdapterKind::OllamaCloud,
+            adapter: AdapterKind::AliyunBailian,
             endpoint: None,
             credentials: vec![CredentialConfig {
+                pool: None,
                 id: "key".into(),
                 api_key: "secret".into(),
             }],
@@ -652,11 +664,12 @@ mod tests {
                 name: "model".into(),
                 protocols: vec![Protocol::OpenAiChat],
                 pricing: None,
+                ..Default::default()
             }],
         };
         assert!(matches!(
             BackendClient::new(&backend, &backend.credentials[0], &backend.models[0]),
-            Err(BackendBuildError::UnsupportedAdapter("ollama-cloud"))
+            Err(BackendBuildError::UnsupportedAdapter("aliyun-bailian"))
         ));
 
         backend.adapter = AdapterKind::CustomChatCompletions;

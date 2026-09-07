@@ -1,7 +1,7 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf};
 
 use clap::Parser;
-use quotamux::{AppState, Config, build_app};
+use quotamux::{Config, workspace::Workspace};
 use tokio::net::TcpListener;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -36,9 +36,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     let listen: SocketAddr = config.server.listen.parse()?;
-    let state = Arc::new(AppState::new(config).await?);
-    state.start_background();
-    let app = build_app(state);
+    let workspace = Workspace::open(&args.config).await?;
+    let app = workspace.router();
     let listener = TcpListener::bind(listen).await?;
     info!(%listen, "QuotaMux listening");
 

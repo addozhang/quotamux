@@ -19,48 +19,39 @@ pub async fn serve_spa(request: Request) -> Response {
 
 #[cfg(test)]
 mod tests {
-    const INDEX: &str = include_str!("../frontend/index.html");
-    const APP: &str = include_str!("../frontend/src/main.js");
+    use super::*;
 
     #[test]
-    fn dashboard_uses_real_routing_and_statistics_endpoints() {
-        assert!(APP.contains("api('/api/routing')"));
-        assert!(APP.contains("/api/routing/stats?model="));
-        assert!(APP.contains("['calls','Calls']"));
-        assert!(APP.contains("['total_tokens','Total tokens']"));
-        assert!(APP.contains("['input_tokens','Input tokens']"));
-        assert!(APP.contains("['output_tokens','Output tokens']"));
-        assert!(APP.contains("['1m','1 month']"));
-        assert!(APP.contains("['all','All time']"));
+    fn embedded_entrypoint_references_existing_built_assets() {
+        let index = DashboardAssets::get("index.html").expect("embedded entrypoint");
+        let html = std::str::from_utf8(&index.data).unwrap();
+        let mut references = 0;
+        for part in html.split("/assets/").skip(1) {
+            let filename = part.split('"').next().unwrap();
+            let asset = DashboardAssets::get(&format!("assets/{filename}"))
+                .expect("entrypoint asset must exist in embedded bundle");
+            assert!(!asset.data.is_empty());
+            references += 1;
+        }
+        assert!(references >= 2, "JavaScript and stylesheet must be bundled");
     }
 
-    #[test]
-    fn dashboard_shows_only_recorded_routing_concepts() {
-        assert!(APP.contains("Route: Fallback exhausted"));
-        for expected in [
-            "Served model",
-            "Layer",
-            "Strategy",
-            "Backend",
-            "Key",
-            "Upstream model",
-            "Circuit",
-            "Next probe",
-        ] {
-            assert!(INDEX.contains(expected), "missing {expected}");
-        }
-        let source = format!("{INDEX}\n{APP}");
-        for absent in [
-            "Protocol",
-            "Degraded",
-            "Bypassed",
-            "progress-bar",
-            "bar-fill",
-            "Share",
-            "Last updated",
-            "Layered multi-provider gateway",
-        ] {
-            assert!(!source.contains(absent), "unexpected {absent}");
-        }
+    #[tokio::test]
+    async fn embedded_dashboard_serves_html() {
+        let request = axum::http::Request::builder()
+            .uri("/")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = serve_spa(request).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
+        );
     }
 }

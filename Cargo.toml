@@ -1,6 +1,6 @@
 [package]
 name = "quotamux"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 description = "A quota-aware local gateway for DeepSeek V4"
@@ -16,6 +16,7 @@ axum = { version = "0.8.9", features = ["http1", "http2", "json", "tokio"] }
 bytes = "1.11.1"
 blake3 = "1.8.5"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde"] }
+chrono-tz = "0.10.4"
 clap = { version = "4.6.6", features = ["derive", "env"] }
 futures-util = "0.3.33"
 getrandom = "0.4.3"
@@ -33,9 +34,10 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
 uuid = { version = "1.24.0", features = ["serde", "v7"] }
 
+tower = { version = "0.5.3", features = ["util"] }
+
 [dev-dependencies]
 tempfile = "3.27.0"
-tower = { version = "0.5.3", features = ["util"] }
 
 [[test]]
 name = "gateway_integration"

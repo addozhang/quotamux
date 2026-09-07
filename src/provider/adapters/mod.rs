@@ -11,6 +11,7 @@ mod custom;
 mod deepseek_official;
 mod kimi_code;
 mod kimi_official;
+mod ollama_cloud;
 mod opencode_go;
 mod zhipu_coding_plan;
 
@@ -64,7 +65,8 @@ pub fn adapter_for(kind: AdapterKind) -> Option<&'static dyn ProviderAdapter> {
         AdapterKind::CustomChatCompletions => Some(&custom::CUSTOM_CHAT_COMPLETIONS),
         AdapterKind::CustomResponses => Some(&custom::CUSTOM_RESPONSES),
         AdapterKind::CustomAnthropic => Some(&custom::CUSTOM_ANTHROPIC),
-        AdapterKind::AliyunBailian | AdapterKind::OllamaCloud | AdapterKind::OpenCodeZen => None,
+        AdapterKind::OllamaCloud => Some(&ollama_cloud::OLLAMA_CLOUD),
+        AdapterKind::AliyunBailian | AdapterKind::OpenCodeZen => None,
     }
 }
 

@@ -234,6 +234,7 @@ struct Gateway {
 impl Gateway {
     async fn start(primary: &MockProvider, fallback: &MockProvider) -> Self {
         let config = Config {
+            capacity_pools: vec![],
             config_version: 3,
             server: ServerConfig {
                 listen: "127.0.0.1:0".into(),
@@ -248,6 +249,7 @@ impl Gateway {
                     adapter: AdapterKind::OpenCodeGo,
                     endpoint: Some(primary.endpoint()),
                     credentials: vec![CredentialConfig {
+                        pool: None,
                         id: "go-plan".into(),
                         api_key: "test-opencode-key".into(),
                     }],
@@ -255,6 +257,7 @@ impl Gateway {
                         name: UPSTREAM_MODEL.into(),
                         protocols: Vec::new(),
                         pricing: None,
+                        ..Default::default()
                     }],
                 },
                 BackendConfig {
@@ -262,6 +265,7 @@ impl Gateway {
                     adapter: AdapterKind::DeepSeekOfficial,
                     endpoint: Some(fallback.endpoint()),
                     credentials: vec![CredentialConfig {
+                        pool: None,
                         id: "deepseek-payg".into(),
                         api_key: "test-deepseek-key".into(),
                     }],
@@ -273,10 +277,13 @@ impl Gateway {
                             Protocol::AnthropicMessages,
                         ],
                         pricing: None,
+                        ..Default::default()
                     }],
                 },
             ],
             models: vec![ServedModelConfig {
+                timezone: "UTC".into(),
+                schedules: vec![],
                 name: LOGICAL_MODEL.into(),
                 aliases: vec![UPSTREAM_MODEL.into()],
                 protocols: vec![
@@ -461,6 +468,7 @@ fn test_backend_adapter_model(
         adapter: kind,
         endpoint: Some(upstream.endpoint()),
         credentials: vec![CredentialConfig {
+            pool: None,
             id: credential.into(),
             api_key: format!("test-key-{credential}"),
         }],
@@ -472,6 +480,7 @@ fn test_backend_adapter_model(
                 vec![protocol]
             },
             pricing: None,
+            ..Default::default()
         }],
     }
 }
@@ -493,6 +502,7 @@ fn test_config(
     layers: Vec<(&str, Vec<RouteTargetConfig>)>,
 ) -> Config {
     Config {
+        capacity_pools: vec![],
         config_version: 3,
         server: ServerConfig {
             listen: "127.0.0.1:0".into(),
@@ -503,6 +513,8 @@ fn test_config(
         affinity: Default::default(),
         backends,
         models: vec![ServedModelConfig {
+            timezone: "UTC".into(),
+            schedules: vec![],
             name: LOGICAL_MODEL.into(),
             aliases: vec![UPSTREAM_MODEL.into()],
             protocols: vec![
@@ -789,6 +801,7 @@ async fn named_tool_choice_reaches_upstream_and_400_does_not_fallback_or_open_ci
     .await;
     let fallback = MockProvider::start(Vec::new()).await;
     let config = Config {
+        capacity_pools: vec![],
         config_version: 3,
         server: ServerConfig {
             listen: "127.0.0.1:0".into(),
@@ -816,6 +829,8 @@ async fn named_tool_choice_reaches_upstream_and_400_does_not_fallback_or_open_ci
             ),
         ],
         models: vec![ServedModelConfig {
+            timezone: "UTC".into(),
+            schedules: vec![],
             name: "kimi-k3".into(),
             aliases: Vec::new(),
             protocols: vec![Protocol::OpenAiChat],
@@ -887,6 +902,7 @@ async fn claude_tool_history_without_thinking_reaches_upstream_without_fallback(
     .await;
     let fallback = MockProvider::start(Vec::new()).await;
     let config = Config {
+        capacity_pools: vec![],
         config_version: 3,
         server: ServerConfig {
             listen: "127.0.0.1:0".into(),
@@ -914,6 +930,8 @@ async fn claude_tool_history_without_thinking_reaches_upstream_without_fallback(
             ),
         ],
         models: vec![ServedModelConfig {
+            timezone: "UTC".into(),
+            schedules: vec![],
             name: "kimi-k3".into(),
             aliases: vec!["kimi-k3[1m]".into()],
             protocols: vec![Protocol::AnthropicMessages],

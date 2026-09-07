@@ -1,283 +1,742 @@
+const app = document.querySelector("#app");
+const esc = (v) =>
+  String(v ?? "").replace(
+    /[&<>"']/g,
+    (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[
+        c
+      ],
+  );
 const state = {
-  view: 'overview',
-  routeView: 'structure',
-  models: [],
-  model: '',
-  window: '1h',
-  metric: 'calls',
-  statsData: null,
-  requestCursor: null,
-  requestCursorStack: [],
-  requestNextCursor: null,
-  requestLoading: false,
-  requestLoadId: 0,
+  live: null,
+  draft: null,
+  revision: null,
+  selected: 0,
+  view: "routing",
+  accounts: false,
+  editing: false,
+  dirty: false,
+  busy: false,
+  message: "",
+  preview: null,
+  at: "",
+  stats: null,
+  history: null,
+  totals: null,
+  alerts: null,
+  window: "1h",
+  metric: "calls",
+  cursor: null,
+  cursors: [],
+  nextCursor: null,
+  childGeneration: 0,
+  loading: false,
 };
-const windows = [['1h','1 hour'],['1d','1 day'],['1w','1 week'],['1m','1 month'],['all','All time']];
-const metrics = [['calls','Calls'],['total_tokens','Total tokens'],['input_tokens','Input tokens'],['output_tokens','Output tokens']];
-const $ = (selector) => document.querySelector(selector);
-const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({
-  '&': '&amp;',
-  '<': '&lt;',
-  '>': '&gt;',
-  '"': '&quot;',
-  "'": '&#39;',
-})[character]);
-const num = (value) => Number(value || 0).toLocaleString();
-const when = (value) => value == null ? '—' : new Date(value).toLocaleString();
-const list = (value) => (value || []).length ? (value || []).map(esc).join(', ') : '—';
-const metricLabel = () => metrics.find(([id]) => id === state.metric)?.[1] || 'Calls';
-const emptyRow = (columns, text) => `<tr><td class="empty" colspan="${columns}">${esc(text)}</td></tr>`;
-
-async function api(path) {
-  const response = await fetch(path, { cache: 'no-store' });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload.error || `${response.status} ${response.statusText}`);
-  return payload;
+const browseActions = new Set([
+  "enable-edit",
+  "disable-edit",
+  "accounts",
+  "select",
+  "view",
+  "window",
+  "metric",
+  "older",
+  "newer",
+  "preview",
+]);
+const protocols = ["openai-chat", "openai-responses", "anthropic-messages"];
+const adapters = [
+  "opencode-go",
+  "deepseek-official",
+  "kimi-official",
+  "kimi-code",
+  "zhipu-coding-plan",
+  "custom-chat-completions",
+  "custom-responses",
+  "custom-anthropic",
+  "ollama-cloud",
+];
+const get = (p) => p.split(".").reduce((v, k) => v?.[k], state.draft);
+function set(p, v) {
+  const keys = p.split(".");
+  const last = keys.pop();
+  keys.reduce((v, k) => v[k], state.draft)[last] = v;
+  state.dirty = true;
+  status();
 }
-
-function showError(error) {
-  const node = $('#error');
-  node.textContent = error?.message || String(error);
-  node.hidden = false;
+const button = (action, label, path = "", extra = "") =>
+  `<button type="button" data-action="${action}" data-path="${esc(path)}" ${extra}>${esc(label)}</button>`;
+function field(path, label, kind = "text", choices = null) {
+  const value = get(path);
+  return `<label><span>${esc(label)}</span>${choices ? `<select data-field="${path}">${[...new Set([...(value ? [value] : []), ...choices])].map((v) => `<option value="${esc(v)}" ${value === v ? "selected" : ""}>${esc(v || "None")}</option>`).join("")}</select>` : `<input data-field="${path}" data-kind="${kind}" type="${kind === "number" ? "number" : kind === "password" ? "password" : "text"}" ${kind === "number" ? 'min="0" step="any"' : ""} value="${esc(kind === "list" ? (value || []).join(", ") : value)}" autocomplete="${kind === "password" ? "new-password" : "off"}">`}</label>`;
 }
-
-function clearError() {
-  $('#error').hidden = true;
-  $('#error').textContent = '';
+function choices(path, label, values) {
+  return `<fieldset class="choices"><legend>${esc(label)}</legend>${values.map(([v, title]) => `<label><input type="checkbox" data-choice="${path}" value="${v}" ${(get(path) || []).includes(v) ? "checked" : ""}>${esc(title)}</label>`).join("")}</fieldset>`;
 }
-
-function aliases(model) {
-  return model.aliases?.length ? ` <span class="aliases">(${model.aliases.map(esc).join(', ')})</span>` : '';
+function refs(path) {
+  const t = get(path),
+    backend = state.draft.backends.find((b) => b.id === t.backend);
+  return `<div class="target-editor">${field(path + ".backend", "Account", "text", ["", ...state.draft.backends.map((b) => b.id)])}${field(path + ".credential", "Credential", "text", ["", ...(backend?.credentials || []).map((c) => c.id)])}${field(path + ".model", "Upstream model", "text", ["", ...(backend?.models || []).map((m) => m.name)])}${button("remove", "Remove target", path)}</div>`;
 }
-
-function activeModel() {
-  return state.models.find((model) => model.name === state.model) || state.models[0];
-}
-
-function renderRequestPagination() {
-  $('#request-page').textContent = `Page ${state.requestCursorStack.length + 1}`;
-  $('#request-newer').disabled = state.requestLoading || state.requestCursorStack.length === 0;
-  $('#request-older').disabled = state.requestLoading || !state.requestNextCursor;
-}
-
-function compactTime(value) {
-  if (value == null) return '<span class="cell-main">—</span>';
-  const date = new Date(value);
-  const full = date.toLocaleString();
-  const day = date.toLocaleDateString(undefined, { month: '2-digit', day: '2-digit' });
-  const time = date.toLocaleTimeString(undefined, { hour12: false });
-  return `<span class="cell-main" title="${esc(full)}">${esc(time)}</span><span class="cell-sub">${esc(day)}</span>`;
-}
-
-function modelCell(row) {
-  const served = row.served_model || '—';
-  const upstream = row.upstream_model || '—';
-  const detail = upstream !== '—' && upstream !== served ? `<span class="cell-sub">→ ${esc(upstream)}</span>` : '';
-  return `<span class="cell-main">${esc(served)}</span>${detail}`;
-}
-
-function targetCell(row) {
-  const backend = row.backend || '—';
-  const key = row.credential || '—';
-  const detail = key !== '—' && key !== backend ? `<span class="cell-sub">${esc(key)}</span>` : '';
-  return `<span class="cell-main">${esc(backend)}</span>${detail}`;
-}
-
-function routeOutcome(row) {
-  if (row.fallback_exhausted) return 'Route: Fallback exhausted';
-  if (row.fallback === true) return 'Route: Fallback';
-  if (row.fallback === false) return 'Route: Primary';
-  return 'Route: —';
-}
-
-function renderOverview(stats, status, recent) {
-  const requests = stats.requests || {};
-  const cards = [
-    ['Requests', num(requests.total)],
-    ['Logical errors', num(requests.errors)],
-    ['Fallbacks', num(requests.fallbacks)],
-    ['Output tokens', num(requests.output_tokens)],
-    ['Traffic', `${(Number(requests.bytes || 0) / 1048576).toFixed(2)} MiB`],
-  ];
-  $('#summary-cards').innerHTML = cards.map(([label, value]) => `<div class="card"><div class="label">${esc(label)}</div><div class="value">${esc(value)}</div></div>`).join('');
-  const backends = Object.entries(stats.backends || {});
-  $('#backend-rows').innerHTML = backends.map(([backend, row]) => {
-    const reported = Number(row.cache_reported_attempts || 0);
-    const hit = Number(row.cache_hit_tokens || 0);
-    const miss = Number(row.cache_miss_tokens || 0);
-    const cache = reported ? (hit + miss ? `${(100 * hit / (hit + miss)).toFixed(1)}%` : '0.0%') : '—';
-    return `<tr><th scope="row">${esc(backend)}</th><td>${list(row.served_models)}</td><td>${list(row.models)}</td><td class="numeric">${num(row.attempts)}</td><td class="numeric good">${num(row.successes)}</td><td class="numeric ${row.errors ? 'bad' : ''}">${num(row.errors)}</td><td class="numeric">${cache}</td><td class="numeric">$${Number(row.cost_usd || 0).toFixed(6)}</td></tr>`;
-  }).join('') || emptyRow(8, 'No backend attempts recorded');
-  $('#request-rows').innerHTML = (recent.requests || []).map((row) => `<tr><td>${compactTime(row.started_at_ms)}</td><td class="request-name">${modelCell(row)}</td><td class="request-name"><span class="cell-main">${esc(row.route_layer || '—')}</span></td><td class="request-name">${targetCell(row)}</td><td><span class="cell-main ${row.status >= 400 ? 'bad' : 'good'}">${num(row.status)}</span><span class="cell-sub">${routeOutcome(row)}</span></td><td class="numeric">${num(row.total_ms)} ms</td><td class="numeric">${num(row.usage?.total_tokens)}</td></tr>`).join('') || emptyRow(7, 'No requests recorded');
-  const alerts = (status.alerts || []).filter((row) => row.active);
-  $('#alert-rows').innerHTML = alerts.map((row) => `<tr><th scope="row">${esc(row.backend)}</th><td>${esc(row.credential || '—')}</td><td class="bad">${esc(row.class)}</td><td>${when(row.last_seen_ms)}</td><td>${when(row.next_probe_at_ms)}</td></tr>`).join('') || emptyRow(5, 'No active alerts');
-}
-
-function circuitLabel(circuit) {
-  if (!circuit) return ['Unknown', ''];
-  return {
-    closed: ['Active', 'state-closed'],
-    open: ['Avoided', 'state-open'],
-    'half-open': ['Half-open probe', 'state-half-open'],
-    suspended: ['Suspended', 'state-suspended'],
-  }[circuit.mode] || [circuit.mode, ''];
-}
-
-function renderStructure(model) {
-  const rows = [];
-  for (const layer of model?.layers || []) {
-    for (const target of layer.targets || []) {
-      const [label, className] = circuitLabel(target.circuit);
-      rows.push(`<tr><th scope="row" class="layer-cell">${num(layer.index + 1)} · ${esc(layer.name)}</th><td class="strategy">${esc(layer.strategy)}</td><td>${esc(target.backend)}</td><td>${esc(target.credential)}</td><td>${esc(target.upstream_model)}</td><td><span class="state ${className}">${esc(label)}</span></td><td>${esc(target.circuit?.reason || '—')}</td><td>${when(target.circuit?.next_probe_at_ms)}</td></tr>`);
-    }
+function render() {
+  if (!state.draft) {
+    app.innerHTML =
+      '<main><h1>Routing</h1><p role="status">Loading workspace…</p></main>';
+    return;
   }
-  $('#structure-rows').innerHTML = rows.join('') || emptyRow(8, 'No routing targets configured');
-}
-
-function renderModelControl() {
-  const node = $('#model-control');
-  if (state.models.length > 1) {
-    node.innerHTML = `<label class="label" for="model-select">Model</label><br><select id="model-select" class="model-select">${state.models.map((model) => `<option value="${esc(model.name)}" ${model.name === state.model ? 'selected' : ''}>${esc(model.name)}${model.aliases?.length ? ` (${model.aliases.map(esc).join(', ')})` : ''}</option>`).join('')}</select>`;
-    $('#model-select').addEventListener('change', (event) => {
-      state.model = event.target.value;
-      state.statsData = null;
-      $('#stats-total').textContent = '—';
-      $('#statistics-rows').innerHTML = emptyRow(6, 'Loading statistics');
-      renderRouting();
+  const model = state.draft.models[state.selected];
+  app.innerHTML = `<header><strong>QuotaMux</strong><span>Routing workspace</span><div class="header-actions">${button("accounts", state.accounts ? "Close accounts" : "Accounts")}${button(state.editing ? "disable-edit" : "enable-edit", state.editing ? "Disable edit" : "Enable edit")}</div></header><div id="notice" role="status" aria-live="polite">${esc(state.message)}</div><div id="migration-notice" role="status">${migrationMessage()}</div><div class="workspace"><aside class="model-rail"><h2>Models</h2>${button("select", "All", "all", `aria-current="${state.selected === "all" ? "page" : "false"}"`)}${state.draft.models.map((m, i) => button("select", m.name || "New model", String(i), `aria-current="${i === state.selected ? "page" : "false"}"`)).join("")}${button("add-model", "+ Add model")}<p class="muted">${state.live?.now ? "Live status " + esc(new Date(state.live.now).toLocaleTimeString()) : ""}</p></aside><main><nav class="child-nav" aria-label="Model views">${(state.selected === "all" ? ["statistics", "history"] : ["routing", "statistics", "history"]).map((v) => button("view", v[0].toUpperCase() + v.slice(1), v, `aria-pressed="${state.view === v}"`)).join("")}</nav>${state.view === "routing" ? (model ? modelEditor(model) : "<h1>Add your first model</h1>") : childView()}</main></div>${state.accounts ? accounts() : ""}<footer><span id="draft-status">${state.dirty ? "Unsaved changes" : "All changes saved"}</span><span>Save validates upstreams and immediately updates routing.</span>${button("discard", "Discard", "", state.busy ? "disabled" : "")}${button("save", state.busy ? "Validating and saving…" : "Save", "", `data-testid="save-workspace" ${state.busy || !state.editing ? "disabled" : ""}`)}</footer>`;
+  if (state.busy)
+    app
+      .querySelectorAll("input,select,button")
+      .forEach((n) => (n.disabled = true));
+  if (!state.editing) {
+    app
+      .querySelectorAll("[data-field],[data-choice]")
+      .forEach((node) => (node.disabled = true));
+    app.querySelectorAll("[data-action]").forEach((node) => {
+      if (!browseActions.has(node.dataset.action)) node.disabled = true;
     });
-  } else {
-    const model = activeModel();
-    node.innerHTML = `<div class="label">Model</div><div class="model-static">${model ? esc(model.name) + aliases(model) : 'No served model configured'}</div>`;
   }
+  updateLive();
 }
-
-function renderControls() {
-  $('#window-control').innerHTML = windows.map(([id, label]) => `<button type="button" data-window="${id}" aria-pressed="${id === state.window}">${esc(label)}</button>`).join('');
-  $('#metric-control').innerHTML = metrics.map(([id, label]) => `<button type="button" data-metric="${id}" aria-pressed="${id === state.metric}">${esc(label)}</button>`).join('');
-  $('#window-control').querySelectorAll('button').forEach((button) => button.addEventListener('click', () => {
-    state.window = button.dataset.window;
-    renderControls();
-    loadStatistics().catch(showError);
-  }));
-  $('#metric-control').querySelectorAll('button').forEach((button) => button.addEventListener('click', () => {
-    state.metric = button.dataset.metric;
-    renderControls();
-    if (state.statsData) renderStatistics(state.statsData);
-  }));
+function modelEditor(m) {
+  const p = `models.${state.selected}`;
+  return `<div class="heading"><div><p class="eyebrow">Public model</p><h1>${esc(m.name || "New model")}</h1></div>${button("remove", "Delete model", p)}</div><div class="row">${field(p + ".name", "Model name")}${field(p + ".aliases", "Aliases (comma separated)", "list")}</div>${choices(
+    p + ".protocols",
+    "Accepted protocols",
+    protocols.map((v) => [v, v]),
+  )}<div class="effective" id="effective-order"></div><section><div class="heading"><h2>Routing layers</h2>${button("add-layer", "+ Add layer", p + ".layers")}</div><p class="muted">Default priority runs top to bottom. A full target is skipped so another target or layer can serve the request.</p>${m.layers
+    .map((l, i) => {
+      const q = `${p}.layers.${i}`;
+      return `<article class="layer-card"><div class="row">${field(q + ".name", "Layer name")}${field(q + ".strategy", "Selection strategy", "text", ["random", "prompt-prefix-affinity"])}<div class="buttons">${button("up", "Move up", q, i === 0 ? "disabled" : "")}${button("down", "Move down", q, i === m.layers.length - 1 ? "disabled" : "")}${button("remove", "Delete layer", q)}</div></div>${l.targets.map((t, j) => `<div class="target">${refs(`${q}.targets.${j}`)}<div class="target-live" data-live-target="${esc([l.name, t.backend, t.credential, t.model].join("|"))}"></div></div>`).join("")}${button("add-target", "+ Add target", q + ".targets")}</article>`;
+    })
+    .join(
+      "",
+    )}</section><section><div class="heading"><h2>Time windows</h2>${button("add-schedule", "+ Add time window", p + ".schedules")}</div>${field(p + ".timezone", "Timezone (IANA name)")}<p class="muted">No matching window uses default priority. Start inclusive, end exclusive; overnight windows belong to their starting day.</p>${(
+    m.schedules || []
+  )
+    .map((s, i) => {
+      const q = `${p}.schedules.${i}`;
+      return `<article><div class="row">${field(q + ".name", "Window name")}${field(q + ".start", "Start (HH:MM or HH:MM:SS)")}${field(q + ".end", "End (HH:MM or HH:MM:SS)")}</div>${choices(
+        q + ".days",
+        "Starting days",
+        [
+          [1, "Mon"],
+          [2, "Tue"],
+          [3, "Wed"],
+          [4, "Thu"],
+          [5, "Fri"],
+          [6, "Sat"],
+          [7, "Sun"],
+        ],
+      )}${scheduleOrder(q, m)}${button("remove", "Delete window", q)}</article>`;
+    })
+    .join(
+      "",
+    )}<div class="preview"><h3>Preview saved policy</h3><p class="muted">Read-only preview uses the currently saved rules, not unsaved edits.</p><label><span>Instant (RFC3339 with timezone)</span><input id="preview-at" value="${esc(state.at)}" placeholder="2026-09-07T12:00:00Z"></label>${button("preview", "Preview saved order")}<div id="preview-result">${state.preview ? esc(state.preview) : ""}</div></div></section>`;
 }
-
-function statValue(totals) {
-  return num(totals?.[state.metric]);
+function accounts() {
+  return `<div class="drawer-backdrop"><aside class="accounts-drawer" aria-label="Accounts"><div class="heading"><h2>Accounts and shared capacity</h2>${button("accounts", "Close accounts")}</div><p class="muted">Credentials stay blank when loaded. Leave an existing key blank to preserve it.</p>${state.draft.backends
+    .map((b, i) => {
+      const p = `backends.${i}`;
+      return `<article><h3>${esc(b.id || "New account")}</h3><div class="row">${field(p + ".id", "Account ID")}${field(p + ".adapter", "Adapter", "text", adapters)}</div>${b.adapter.startsWith("custom-") ? field(p + ".endpoint", "Endpoint URL (blank preserves existing)") : '<p class="muted">Official endpoint managed by adapter</p>'}<h4>Credentials</h4>${b.credentials
+        .map((c, j) => {
+          const q = `${p}.credentials.${j}`;
+          return `<div class="credential"><div class="row">${field(q + ".id", "Credential ID")}${field(q + ".api_key", "API key (blank preserves existing)", "password")}${field(q + ".pool", "Shared pool", "text", ["", ...(state.draft.capacity_pools || []).map((p) => p.id)])}</div>${button("remove", "Delete credential", q)}</div>`;
+        })
+        .join(
+          "",
+        )}${button("add-credential", "+ Add credential", p + ".credentials")}<h4>Upstream models</h4>${b.models
+        .map((m, j) => {
+          const q = `${p}.models.${j}`;
+          return `<fieldset><legend>Upstream model</legend>${field(q + ".name", "Upstream model name")}${choices(
+            q + ".protocols",
+            "Protocols (empty uses adapter defaults)",
+            protocols.map((v) => [v, v]),
+          )}${priceEditor(q,b.id,m)}${button("remove", "Delete upstream model", q)}</fieldset>`;
+        })
+        .join(
+          "",
+        )}${button("add-upstream", "+ Add upstream model", p + ".models")}${button("remove", "Delete account", p)}</article>`;
+    })
+    .join(
+      "",
+    )}${button("add-backend", "+ Add account")}<h3>Shared capacity pools</h3><p class="muted">Assign credentials above. No pool means no local concurrency limit.</p>${(state.draft.capacity_pools || []).map((p, i) => `<article><div class="row">${field(`capacity_pools.${i}.id`, "Pool ID")}${field(`capacity_pools.${i}.max_in_flight`, "Maximum concurrent requests", "number")}${button("remove", "Delete pool", `capacity_pools.${i}`)}</div></article>`).join("")}${button("add-pool", "+ Add pool")}${advanced()}</aside></div>`;
 }
-
-function renderStatistics(data) {
-  $('#metric-heading').textContent = metricLabel();
-  $('#stats-total').textContent = statValue(data.totals);
-  $('#stats-period').textContent = windows.find(([id]) => id === state.window)?.[1] || data.window?.id || 'Statistics';
-  const rows = [];
-  for (const layer of data.layers || []) {
-    rows.push(`<tr class="ledger-layer"><td class="ledger-kind">Layer total</td><th scope="row">${num(layer.index + 1)} · ${esc(layer.name)}</th><td>—</td><td>—</td><td>—</td><td class="numeric">${statValue(layer.totals)}</td></tr>`);
-    for (const target of layer.targets || []) {
-      rows.push(`<tr class="ledger-target"><th scope="row">Target</th><td>${esc(layer.name)}</td><td>${esc(target.backend)}</td><td>${esc(target.credential)}</td><td>${esc(target.upstream_model)}</td><td class="numeric">${statValue(target.totals)}</td></tr>`);
-    }
+const windows = [
+  ["1h", "1 hour"],
+  ["1d", "1 day"],
+  ["1w", "1 week"],
+  ["1m", "1 month"],
+  ["all", "All time"],
+];
+const metrics = [
+  ["calls", "Calls"],
+  ["total_tokens", "Total tokens"],
+  ["input_tokens", "Input tokens"],
+  ["output_tokens", "Output tokens"],
+];
+function scheduleOrder(path, model) {
+  const order = get(path + ".order");
+  return `<fieldset><legend>Layer priority for this window</legend>${order
+    .map(
+      (name, index) =>
+        `<div class="row">${field(
+          `${path}.order.${index}`,
+          `Priority ${index + 1}`,
+          "text",
+          model.layers.map((layer) => layer.name),
+        )}${button("up", "Move priority up", `${path}.order.${index}`, index === 0 ? "disabled" : "")}${button("down", "Move priority down", `${path}.order.${index}`, index === order.length - 1 ? "disabled" : "")}</div>`,
+    )
+    .join("")}</fieldset>`;
+}
+function priceFields(path) {
+  return `<div class="row">${field(path+'.cache_hit_input_usd_per_million','Cached input USD / million','number')}${field(path+'.cache_miss_input_usd_per_million','Uncached input USD / million','number')}${field(path+'.output_usd_per_million','Output USD / million','number')}</div>`;
+}
+function activePriceText(row) {
+  if(!row?.rates)return 'No published usage rates configured';
+  const rates=row.rates;
+  return `${row.active_window || 'Base rates'} · cached input ${rates.cache_hit_input_usd_per_million}, uncached input ${rates.cache_miss_input_usd_per_million}, output ${rates.output_usd_per_million} USD / million tokens`;
+}
+function priceEditor(path, backend, model) {
+  return `<h4>Published usage rates (USD per million tokens)</h4><p class="muted" data-price-backend="${esc(backend)}" data-price-model="${esc(model.name)}">${esc(activePriceText(state.live.pricing?.find(row=>row.backend===backend&&row.model===model.name)))}</p><p class="muted">Usage value is an estimate, not an actual cash bill. Subscription requests may consume quota.</p>${field(path+'.pricing_note','Billing context (subscription, points or quota)')}${field(path+'.pricing_source','Rate reference URL or source')}${model.pricing?`${priceFields(path+'.pricing')}${button('remove-pricing','Remove published rates',path)}${button('add-price-window','Add price window',path)}`:button('add-pricing','Add pricing',path)}${model.pricing_schedule?`<div>${field(path+'.pricing_schedule.timezone','Price timezone (IANA name)')}${model.pricing_schedule.windows.map((window,index)=>{const q=`${path}.pricing_schedule.windows.${index}`;return `<fieldset><legend>Price window</legend><div class="row">${field(q+'.name','Price window name')}${field(q+'.start','Price start (HH:MM or HH:MM:SS)')}${field(q+'.end','Price end (HH:MM or HH:MM:SS)')}</div>${choices(q+'.days','Price starting days',[[1,'Mon'],[2,'Tue'],[3,'Wed'],[4,'Thu'],[5,'Fri'],[6,'Sat'],[7,'Sun']])}${priceFields(q+'.pricing')}${button('remove','Delete price window',q)}</fieldset>`;}).join('')}</div>`:''}`;
+}
+function advanced() {
+  const tuning = {
+    "server.max_inference_body_bytes": "Maximum request body (bytes)",
+    "server.timeouts.upstream_connect_ms": "Upstream connection timeout (ms)",
+    "server.timeouts.upstream_read_ms": "Upstream response timeout (ms)",
+    "server.timeouts.upstream_stream_read_ms": "Stream inactivity timeout (ms)",
+    "server.timeouts.upstream_total_ms": "Total upstream timeout (ms)",
+    "server.timeouts.downstream_sse_heartbeat_ms":
+      "Stream heartbeat interval (ms)",
+    "server.timeouts.route_probe_wait_ms": "Route recovery wait (ms)",
+    "affinity.checkpoint_bytes": "Prefix checkpoint size (bytes)",
+    "affinity.max_checkpoints_per_path": "Maximum checkpoints per request",
+    "affinity.max_candidates_per_prefix": "Maximum candidates per prefix",
+    "affinity.max_leases": "Maximum affinity leases",
+    "affinity.success_ttl_ms": "Successful affinity lifetime (ms)",
+  };
+  return `<details><summary>Advanced runtime settings</summary><p class="muted">These settings apply on Save. Listener and data location require a restart.</p><div class="row"><label>Listener<input readonly value="${esc(state.draft.server.listen)}"></label><label>Data directory<input readonly value="${esc(state.draft.server.data_dir)}"></label></div><div class="row">${Object.entries(
+    tuning,
+  )
+    .map(([path, label]) => field(path, label, "number"))
+    .join("")}</div></details>`;
+}
+function childView() {
+  const model = state.draft.models[state.selected];
+  if (
+    state.selected !== "all" &&
+    (!model || !state.live.models.some((row) => row.name === model.name))
+  )
+    return "<h1>No saved data</h1><p>Save this model to view its statistics and history.</p>";
+  if (state.loading) return '<p role="status">Loading selected scope…</p>';
+  if (state.view === "statistics" && state.selected === "all")
+    return globalStatistics();
+  if (state.view === "history") {
+    return `<h1>Recent request history</h1><div class="buttons">${button("newer", "Newer", "", state.cursors.length ? "" : "disabled")}<span>Page ${state.cursors.length + 1}</span>${button("older", "Older", "", state.nextCursor ? "" : "disabled")}</div><div class="table-scroll"><table><thead><tr><th>Started</th><th>Model</th><th>Layer</th><th>Account / key</th><th>Status</th><th>Tokens</th></tr></thead><tbody>${(state.history?.requests || []).map((r) => `<tr><td>${esc(new Date(r.started_at_ms).toLocaleString())}</td><td>${esc(r.served_model)}</td><td>${esc(r.route_layer)}</td><td>${esc(r.backend)} / ${esc(r.credential)}</td><td>${esc(r.status)}</td><td>${esc(r.usage?.total_tokens || 0)}</td></tr>`).join("")}</tbody></table></div>`;
   }
-  for (const target of data.historical_targets || []) {
-    rows.push(`<tr class="ledger-target ledger-historical"><th scope="row">Historical target</th><td>${esc(target.layer_name || `Layer ${Number(target.layer_index || 0) + 1}`)}</td><td>${esc(target.backend)}</td><td>${esc(target.credential)}</td><td>${esc(target.upstream_model)}</td><td class="numeric">${statValue(target.totals)}</td></tr>`);
-  }
-  const unattributed = Number(data.unattributed?.[state.metric] || 0);
-  if (unattributed) rows.push(`<tr class="ledger-historical"><th scope="row">Unattributed</th><td>—</td><td>—</td><td>—</td><td>—</td><td class="numeric">${num(unattributed)}</td></tr>`);
-  $('#statistics-rows').innerHTML = rows.join('') || emptyRow(6, 'No routing layers configured');
+  const value = (totals) =>
+    Number(totals?.[state.metric] || 0).toLocaleString();
+  const targetRow = (target, layer, historical = false) =>
+    `<tr><td>${historical ? "Historical target" : "Target"}</td><td>${esc(layer)}</td><td>${esc(target.backend)}</td><td>${esc(target.credential)}</td><td>${esc(target.upstream_model || target.model)}</td><td>${value(target.totals)}</td></tr>`;
+  return `<h1>Model statistics</h1><div class="buttons">${windows.map(([id, label]) => button("window", label, id, `aria-pressed="${id === state.window}"`)).join("")}</div><div class="buttons">${metrics.map(([id, label]) => button("metric", label, id, `aria-pressed="${id === state.metric}"`)).join("")}</div><p>Model total: ${value(state.stats?.totals)}</p><div class="table-scroll"><table><thead><tr><th>Entry</th><th>Layer</th><th>Account</th><th>Key</th><th>Upstream model</th><th>${esc(metrics.find(([id]) => id === state.metric)?.[1])}</th></tr></thead><tbody>${(state.stats?.layers || []).map((layer) => `<tr><th>Layer total</th><td>${esc(layer.name)}</td><td></td><td></td><td></td><td>${value(layer.totals)}</td></tr>${(layer.targets || []).map((target) => targetRow(target, layer.name)).join("")}`).join("")}${(state.stats?.historical_targets || []).map((target) => targetRow(target, target.layer_name || target.layer_index, true)).join("")}<tr><td>Unattributed</td><td colspan="4"></td><td>${value(state.stats?.unattributed)}</td></tr></tbody></table></div>`;
 }
-
-async function loadOverview() {
-  const cursor = state.requestCursor;
-  const loadId = ++state.requestLoadId;
-  const before = cursor ? `&before=${encodeURIComponent(cursor)}` : '';
-  state.requestLoading = true;
-  renderRequestPagination();
-  try {
-    const [status, stats, recent] = await Promise.all([
-      api('/api/status'),
-      api('/api/stats'),
-      api(`/api/requests?limit=20${before}`),
-    ]);
-    if (loadId !== state.requestLoadId || cursor !== state.requestCursor) return;
-    state.requestNextCursor = recent.next_cursor || null;
-    renderOverview(stats, status, recent);
-  } finally {
-    if (loadId === state.requestLoadId && cursor === state.requestCursor) {
-      state.requestLoading = false;
-      renderRequestPagination();
-    }
-  }
+function globalStatistics() {
+  return `<h1>All statistics</h1><p>All time</p><h2>Account totals</h2><div class="table-scroll"><table><thead><tr><th>Account</th><th>Attempts</th><th>Successes</th><th>Errors</th><th>Cache hit</th><th>Usage value estimate (USD)</th></tr></thead><tbody>${Object.entries(
+    state.totals?.backends || {},
+  )
+    .map(([id, row]) => {
+      const total =
+        Number(row.cache_hit_tokens || 0) + Number(row.cache_miss_tokens || 0);
+      return `<tr><td>${esc(id)}</td><td>${row.attempts || 0}</td><td>${row.successes || 0}</td><td>${row.errors || 0}</td><td>${row.cache_reported_attempts ? (total ? (100 * row.cache_hit_tokens) / total : 0).toFixed(1) + "%" : "—"}</td><td>${Number(row.cost_usd || 0).toFixed(6)}</td></tr>`;
+    })
+    .join(
+      "",
+    )}</tbody></table></div><h2>Active alerts</h2><div class="table-scroll"><table><thead><tr><th>Account</th><th>Key</th><th>Class</th><th>Last seen</th><th>Next probe</th></tr></thead><tbody>${(
+    state.alerts?.alerts || []
+  )
+    .filter((a) => a.active)
+    .map(
+      (a) =>
+        `<tr><td>${esc(a.backend)}</td><td>${esc(a.credential)}</td><td>${esc(a.class)}</td><td>${esc(new Date(a.last_seen_ms).toLocaleString())}</td><td>${a.next_probe_at_ms ? esc(new Date(a.next_probe_at_ms).toLocaleString()) : "—"}</td></tr>`,
+    )
+    .join("")}</tbody></table></div>`;
 }
-
-async function loadRouting() {
-  const payload = await api('/api/routing');
-  state.models = payload.models || [];
-  if (!state.models.some((model) => model.name === state.model)) state.model = state.models[0]?.name || '';
-  renderModelControl();
-  renderRouting();
+function updateLive() {
+  document.querySelectorAll("[data-price-backend]").forEach(node=>node.textContent=activePriceText(state.live?.pricing?.find(row=>row.backend===node.dataset.priceBackend&&row.model===node.dataset.priceModel)));
+  const m = state.draft?.models[state.selected];
+  const live = state.live?.models.find((row) => row.name === m?.name);
+  const order = document.querySelector("#effective-order");
+  if (order)
+    order.textContent = live
+      ? `Live priority: ${live.effective_order.join(" → ")} · ${live.active_schedule || "Default order"}`
+      : "New model — not saved yet";
+  document.querySelectorAll("[data-live-target]").forEach((node) => {
+    const [layer, backend, credential, model] =
+      node.dataset.liveTarget.split("|");
+    const t = live?.layers
+      .find((l) => l.name === layer)
+      ?.targets.find(
+        (t) =>
+          t.backend === backend &&
+          t.credential === credential &&
+          t.upstream_model === model,
+      );
+    node.textContent = t
+      ? `${t.circuit?.mode || "Unknown health"} · ${t.pool ? `Pool ${t.pool}: ${t.in_flight} / ${t.max_in_flight} in flight` : "No local capacity limit"}`
+      : "Not in active routing";
+  });
 }
-
-async function loadStatistics() {
-  if (!state.model) return;
-  const data = await api(`/api/routing/stats?model=${encodeURIComponent(state.model)}&window=${encodeURIComponent(state.window)}`);
-  state.statsData = data;
-  renderStatistics(data);
+function migrationMessage() {
+  return state.live?.migration?.persisted === false
+    ? "Active routing loaded. Make the configuration directory writable to save the migration."
+    : "";
 }
-
-function renderRouting() {
-  const model = activeModel();
-  $('#routing-title').innerHTML = model ? esc(model.name) + aliases(model) : 'Routing';
-  renderStructure(model);
-  if (state.routeView === 'statistics') loadStatistics().catch(showError);
+function status() {
+  const n = document.querySelector("#draft-status");
+  if (n) n.textContent = state.dirty ? "Unsaved changes" : "All changes saved";
+  const notice = document.querySelector("#notice");
+  if (notice) notice.textContent = state.message;
+  const migration = document.querySelector("#migration-notice");
+  if (migration) migration.textContent = migrationMessage();
 }
-
+async function request(path, options = {}) {
+  const response = await fetch(path, {
+    cache: "no-store",
+    ...options,
+    headers: {
+      ...options.headers,
+    },
+  });
+  const data = await response.json();
+  if (!response.ok)
+    throw Error(
+      `${response.status === 409 ? "Conflict: " : ""}${data.error || response.statusText}`,
+    );
+  return data;
+}
+function adopt(data) {
+  const selectedName = state.draft?.models[state.selected]?.name;
+  const wasAll = state.selected === "all";
+  resetChildren();
+  state.preview = null;
+  state.live = data;
+  state.draft = structuredClone(data.document);
+  state.draft.capacity_pools ||= [];
+  state.draft.models.forEach((m) => {
+    m.timezone ||= "UTC";
+    m.schedules ||= [];
+  });
+  state.revision = data.revision;
+  const matched = state.draft.models.findIndex(model => model.name === selectedName);
+  state.selected = wasAll ? "all" : matched >= 0 ? matched : Math.min(state.selected, Math.max(0, state.draft.models.length - 1));
+  state.dirty = false;
+  if (state.view !== 'routing') queueMicrotask(() => children());
+}
 async function refresh() {
-  clearError();
   try {
-    if (state.view === 'overview') await loadOverview();
-    else await loadRouting();
-  } catch (error) {
-    showError(error);
+    const data = await request("/api/routing");
+    state.live = data;
+    if (
+      !state.draft ||
+      (!state.dirty && !state.busy && data.revision !== state.revision)
+    ) {
+      adopt(data);
+      render();
+    } else {
+      if (state.dirty && data.revision !== state.revision && !state.busy) {
+        state.message =
+          "Routing changed elsewhere. Your draft is retained; use Discard to load the latest saved routing.";
+      }
+      updateLive();
+      status();
+    }
+  } catch (e) {
+    state.message = e.message;
+    if (!state.draft)
+      app.innerHTML = `<main><h1>Routing unavailable</h1><p>${esc(e.message)}</p></main>`;
+    else status();
   }
 }
-
-function selectView(view) {
-  state.view = view;
-  $('#overview-view').hidden = view !== 'overview';
-  $('#routing-view').hidden = view !== 'routing';
-  document.querySelectorAll('[data-view]').forEach((button) => button.setAttribute('aria-selected', String(button.dataset.view === view)));
-  refresh();
+function resetChildren() {
+  state.childGeneration++;
+  state.cursor = null;
+  state.cursors = [];
+  state.nextCursor = null;
+  state.stats = null;
+  state.totals = null;
+  state.alerts = null;
+  state.history = null;
+  state.loading = false;
 }
-
-function selectRouteView(view) {
-  state.routeView = view;
-  $('#structure-panel').hidden = view !== 'structure';
-  $('#statistics-panel').hidden = view !== 'statistics';
-  document.querySelectorAll('[data-route-view]').forEach((button) => button.setAttribute('aria-selected', String(button.dataset.routeView === view)));
-  renderRouting();
+async function children() {
+  const generation = ++state.childGeneration;
+  const selected = state.selected,
+    view = state.view,
+    window = state.window,
+    cursor = state.cursor;
+  const model = state.draft.models[selected];
+  if (
+    selected !== "all" &&
+    (!model || !state.live.models.some((row) => row.name === model.name))
+  ) {
+    render();
+    return;
+  }
+  state.loading = true;
+  render();
+  try {
+    let result;
+    if (view === "statistics")
+      result =
+        selected === "all"
+          ? await Promise.all([request("/api/stats"), request("/api/status")])
+          : await request(
+              `/api/routing/stats?model=${encodeURIComponent(model.name)}&window=${window}`,
+            );
+    if (view === "history")
+      result = await request(
+        "/api/requests?limit=20" +
+          (selected === "all"
+            ? ""
+            : "&model=" + encodeURIComponent(model.name)) +
+          (cursor ? "&before=" + encodeURIComponent(cursor) : ""),
+      );
+    if (generation !== state.childGeneration) return;
+    state.loading = false;
+    if (view === "statistics") {
+      if (selected === "all") [state.totals, state.alerts] = result;
+      else state.stats = result;
+    }
+    if (view === "history") {
+      state.history = result;
+      state.nextCursor = result.next_cursor;
+    }
+    render();
+  } catch (error) {
+    if (generation !== state.childGeneration) return;
+    state.loading = false;
+    state.message = error.message;
+    render();
+  }
 }
-
-document.querySelectorAll('[data-view]').forEach((button) => button.addEventListener('click', () => selectView(button.dataset.view)));
-document.querySelectorAll('[data-route-view]').forEach((button) => button.addEventListener('click', () => selectRouteView(button.dataset.routeView)));
-$('#request-newer').addEventListener('click', () => {
-  if (state.requestLoading || state.requestCursorStack.length === 0) return;
-  clearError();
-  state.requestCursor = state.requestCursorStack.pop() ?? null;
-  state.requestNextCursor = null;
-  loadOverview().catch(showError);
+app.addEventListener("input", (event) => {
+  const n = event.target;
+  if (n.id === "preview-at") {
+    state.at = n.value;
+    return;
+  }
+  if (!state.editing || state.busy) return;
+  if (n.dataset.field?.match(/^models\.\d+\.layers\.\d+\.name$/)) {
+    const old = get(n.dataset.field);
+    const model = get(n.dataset.field.split(".").slice(0, 2).join("."));
+    model.schedules.forEach(
+      (schedule) =>
+        (schedule.order = schedule.order.map((name) =>
+          name === old ? n.value : name,
+        )),
+    );
+  }
+  if (n.dataset.field) {
+    set(
+      n.dataset.field,
+      n.dataset.kind === "list"
+        ? n.value
+            .split(",")
+            .map((v) => v.trim())
+            .filter(Boolean)
+        : n.dataset.kind === "number"
+          ? Number(n.value)
+          : n.value,
+    );
+  }
+  if (n.dataset.choice) {
+    const numeric = n.dataset.choice.endsWith(".days");
+    const v = numeric ? Number(n.value) : n.value;
+    const values = new Set(get(n.dataset.choice) || []);
+    n.checked ? values.add(v) : values.delete(v);
+    set(n.dataset.choice, [...values]);
+  }
 });
-$('#request-older').addEventListener('click', () => {
-  if (state.requestLoading || !state.requestNextCursor) return;
-  clearError();
-  state.requestCursorStack.push(state.requestCursor);
-  state.requestCursor = state.requestNextCursor;
-  state.requestNextCursor = null;
-  loadOverview().catch(showError);
+app.addEventListener("change", (event) => {
+  if (!state.editing || state.busy) return;
+  const path = event.target.dataset.field;
+  if (path?.endsWith(".backend")) {
+    const target = get(path.slice(0, -8));
+    target.credential = "";
+    target.model = "";
+    render();
+  }
+  if (path?.endsWith(".adapter")) {
+    const backend = get(path.slice(0, -8));
+    delete backend.endpoint;
+    const adapterProtocols = {
+      "opencode-go": [],
+      "custom-chat-completions": ["openai-chat"],
+      "custom-responses": ["openai-responses"],
+      "custom-anthropic": ["anthropic-messages"],
+      "kimi-code": ["openai-chat", "anthropic-messages"],
+      "kimi-official": ["openai-chat"],
+      "ollama-cloud": ["openai-chat"],
+    };
+    backend.models.forEach(
+      (model) =>
+        (model.protocols = [
+          ...(adapterProtocols[backend.adapter] || protocols),
+        ]),
+    );
+    render();
+  }
+  if (path?.match(/\.order\.\d+$/)) {
+    const keys = path.split(".");
+    const index = Number(keys.pop());
+    const order = get(keys.join("."));
+    const names = state.draft.models[state.selected].layers.map(
+      (layer) => layer.name,
+    );
+    const missing = names.find((name) => !order.includes(name));
+    const duplicate = order.findIndex(
+      (name, i) => i !== index && name === order[index],
+    );
+    if (duplicate >= 0 && missing) order[duplicate] = missing;
+    render();
+  }
+  if (path?.endsWith(".name") || path?.endsWith(".id")) {
+    // Refresh references in place so a blur cannot replace the clicked control.
+    app.querySelectorAll('select[data-field]').forEach(select => {
+      const reference = select.dataset.field;
+      let values;
+      if (reference.endsWith('.pool')) values = ['', ...state.draft.capacity_pools.map(pool => pool.id)];
+      else if (reference.endsWith('.backend')) values = ['', ...state.draft.backends.map(backend => backend.id)];
+      else if (/\.targets\.\d+\.(credential|model)$/.test(reference)) {
+        const target = get(reference.split('.').slice(0, -1).join('.'));
+        const backend = state.draft.backends.find(row => row.id === target.backend);
+        values = reference.endsWith('.credential') ? ['', ...(backend?.credentials || []).map(row => row.id)] : ['', ...(backend?.models || []).map(row => row.name)];
+      } else if (/\.order\.\d+$/.test(reference)) values = get(reference.split('.').slice(0, 2).join('.')).layers.map(layer => layer.name);
+      if (values) {
+        const current = get(reference);
+        select.innerHTML = [...new Set([...(current ? [current] : []), ...values])].map(value => `<option value="${esc(value)}" ${value === current ? 'selected' : ''}>${esc(value || 'None')}</option>`).join('');
+      }
+    });
+    state.draft.models.forEach((model, index) => {
+      const rail = app.querySelector(`[data-action="select"][data-path="${index}"]`);
+      if (rail) rail.textContent = model.name || 'New model';
+    });
+    if (state.view === 'routing') {
+      const heading = app.querySelector('main h1');
+      if (heading) heading.textContent = state.draft.models[state.selected]?.name || 'New model';
+    }
+  }
 });
-renderControls();
-renderRequestPagination();
+app.addEventListener("click", async (event) => {
+  const n = event.target.closest("[data-action]");
+  if (!n || state.busy) return;
+  const a = n.dataset.action,
+    p = n.dataset.path;
+  if ((!state.editing) && !browseActions.has(a)) return;
+  try {
+    if (a === "enable-edit") {
+      state.editing = true;
+      render();
+      return;
+    }
+    if (a === "disable-edit") {
+      if (state.dirty) {
+        if (!confirm("Discard unsaved changes and disable editing?")) return;
+        adopt(await request("/api/routing"));
+      }
+      state.editing = false;
+      render();
+      return;
+    }
+    if (a === "window") {
+      state.window = p;
+      await children();
+      return;
+    }
+    if (a === "metric") {
+      state.metric = p;
+      render();
+      return;
+    }
+    if (a === "older") {
+      if (state.nextCursor) {
+        state.cursors.push(state.cursor);
+        state.cursor = state.nextCursor;
+        await children();
+      }
+      return;
+    }
+    if (a === "newer") {
+      if (state.cursors.length) {
+        state.cursor = state.cursors.pop();
+        await children();
+      }
+      return;
+    }
+    if (a === "accounts") {
+      state.accounts = !state.accounts;
+      render();
+      return;
+    }
+    if (a === "select") {
+      resetChildren();
+      state.selected = p === "all" ? "all" : Number(p);
+      if (state.selected === "all" && state.view === "routing")
+        state.view = "statistics";
+      state.preview = null;
+      render();
+      if (state.view !== "routing") await children();
+      return;
+    }
+    if (a === "view") {
+      if (state.selected === "all" && p === "routing") return;
+      resetChildren();
+      state.view = p;
+      render();
+      if (p !== "routing") await children();
+      return;
+    }
+    if (a === "discard") {
+      if (state.dirty && !confirm("Discard all unsaved changes?")) return;
+      adopt(await request("/api/routing"));
+      state.message = "Draft discarded.";
+      render();
+      return;
+    }
+    if (a === "save") {
+      state.busy = true;
+      state.message = "Validating upstreams and saving…";
+      render();
+      const doc = structuredClone(state.draft);
+      doc.backends.forEach((b) =>
+        b.credentials.forEach((c) => {
+          if (!c.pool) delete c.pool;
+        }),
+      );
+      try {
+        adopt(
+          await request("/api/routing", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ revision: state.revision, document: doc }),
+          }),
+        );
+        state.message = "Saved. New requests use this routing.";
+      } finally {
+        state.busy = false;
+        render();
+      }
+      return;
+    }
+    if (a === "preview") {
+      const generation = state.childGeneration;
+      const selectedName = state.draft.models[state.selected]?.name;
+      const view = state.view;
+      const instant = state.at;
+      const data = await request("/api/routing?at=" + encodeURIComponent(instant));
+      if (generation !== state.childGeneration || view !== state.view || selectedName !== state.draft.models[state.selected]?.name || instant !== state.at) return;
+      const model = data.models.find(model => model.name === selectedName);
+      const pairs = new Set((model?.layers || []).flatMap(layer => layer.targets.map(target => JSON.stringify([target.backend, target.upstream_model]))));
+      state.preview = model ? `${model.active_schedule || "Default order"}: ${model.effective_order.join(" → ")}` : "Model not yet saved";
+      state.preview += "\n" + (data.pricing || []).filter(row => pairs.has(JSON.stringify([row.backend, row.model]))).map(row => `${row.backend}/${row.model}: ${activePriceText(row)}`).join("\n");
+      const result = document.querySelector('#preview-result');
+      if (result) result.textContent = state.preview;
+      return;
+    }
+    if (["remove", "up", "down"].includes(a)) {
+      const keys = p.split("."),
+        i = Number(keys.pop()),
+        array = get(keys.join("."));
+      if (a === "remove") {
+        if (p.match(/^models\.\d+\.layers\.\d+$/)) {
+          const model = get(keys.slice(0, 2).join("."));
+          model.schedules.forEach(
+            (schedule) =>
+              (schedule.order = schedule.order.filter(
+                (name) => name !== array[i].name,
+              )),
+          );
+        }
+        array.splice(i, 1);
+      } else {
+        const j = i + (a === "up" ? -1 : 1);
+        if (j >= 0 && j < array.length)
+          [array[i], array[j]] = [array[j], array[i]];
+      }
+      state.selected = state.selected === "all" ? "all" : Math.min(
+        state.selected,
+        Math.max(0, state.draft.models.length - 1),
+      );
+    }
+    const defaults = {
+      "add-model": {
+        name: "",
+        aliases: [],
+        protocols: ["openai-chat"],
+        layers: [],
+        timezone: "UTC",
+        schedules: [],
+      },
+      "add-layer": { name: "", strategy: "random", targets: [] },
+      "add-target": { backend: "", credential: "", model: "" },
+      "add-backend": {
+        id: "",
+        adapter: "custom-chat-completions",
+        endpoint: "",
+        credentials: [],
+        models: [],
+      },
+      "add-credential": { id: "", api_key: "" },
+      "add-upstream": { name: "", protocols: ["openai-chat"] },
+      "add-pool": { id: "", max_in_flight: 1 },
+      "add-schedule": {
+        name: "",
+        days: [1, 2, 3, 4, 5, 6, 7],
+        start: "09:00",
+        end: "17:00",
+        order:
+          state.draft.models[state.selected]?.layers.map((l) => l.name) || [],
+      },
+    };
+    if (defaults[a]) {
+      const array =
+        a === "add-model"
+          ? state.draft.models
+          : a === "add-backend"
+            ? state.draft.backends
+            : a === "add-pool"
+              ? state.draft.capacity_pools
+              : get(p);
+      array.push(defaults[a]);
+      if (a === "add-layer") {
+        get(p.split(".").slice(0, 2).join(".")).schedules.forEach((schedule) =>
+          schedule.order.push(""),
+        );
+      }
+      if (a === "add-model") {resetChildren();state.selected = array.length - 1;state.view="routing";}
+    }
+    if (a === "add-pricing")
+      get(p).pricing = {
+        cache_hit_input_usd_per_million: 0,
+        cache_miss_input_usd_per_million: 0,
+        output_usd_per_million: 0,
+      };
+    if (a === "remove-pricing") {delete get(p).pricing;delete get(p).pricing_schedule;}
+    if (a === "add-price-window") {
+      const model=get(p);
+      model.pricing_schedule ||= {timezone:'UTC',windows:[]};
+      model.pricing_schedule.windows.push({name:'',days:[1,2,3,4,5,6,7],start:'09:00',end:'17:00',pricing:structuredClone(model.pricing)});
+    }
+    state.dirty = true;
+    render();
+  } catch (e) {
+    state.message = e.message;
+    status();
+  }
+});
+render();
 refresh();
 setInterval(refresh, 5000);

@@ -45,21 +45,26 @@ const SAME_TARGET_RETRY_MAX_MS: u64 = 500;
 
 pub struct AppState {
     pub config: Config,
+    pub(crate) calendars: HashMap<String, crate::calendar::Calendar>,
     pub store: Store,
-    targets: HashMap<RouteTargetConfig, Arc<TargetRuntime>>,
+    pub(crate) targets: HashMap<RouteTargetConfig, Arc<TargetRuntime>>,
     selector: RandomSelector,
-    affinity: AffinityDirectory,
+    pub(crate) affinity: Arc<AffinityDirectory>,
+    pub(crate) admission: Arc<crate::admission::Admission>,
     started_at_ms: i64,
 }
 
-struct TargetRuntime {
-    client: BackendClient,
-    circuit: Arc<CircuitBreaker>,
+pub(crate) struct TargetRuntime {
+    pub(crate) identity: String,
+    pub(crate) account: String,
+    pub(crate) pool: Option<String>,
+    pub(crate) client: BackendClient,
+    pub(crate) circuit: Arc<CircuitBreaker>,
 }
 
 impl AppState {
     pub async fn new(config: Config) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::new_with_selector(config, RandomSelector::default(), HashMap::new()).await
+        Self::new_with_selector(config, RandomSelector::default(), HashMap::new(), None).await
     }
 
     #[doc(hidden)]
@@ -67,7 +72,13 @@ impl AppState {
         config: Config,
         seed: u64,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::new_with_selector(config, RandomSelector::with_seed(seed), HashMap::new()).await
+        Self::new_with_selector(
+            config,
+            RandomSelector::with_seed(seed),
+            HashMap::new(),
+            None,
+        )
+        .await
     }
 
     #[doc(hidden)]
@@ -77,13 +88,33 @@ impl AppState {
         seed: u64,
         endpoint_overrides: HashMap<String, String>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::new_with_selector(config, RandomSelector::with_seed(seed), endpoint_overrides).await
+        Self::new_with_selector(
+            config,
+            RandomSelector::with_seed(seed),
+            endpoint_overrides,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn revise(
+        config: Config,
+        previous: &Self,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::new_with_selector(
+            config,
+            RandomSelector::default(),
+            HashMap::new(),
+            Some(previous),
+        )
+        .await
     }
 
     async fn new_with_selector(
         config: Config,
         selector: RandomSelector,
         endpoint_overrides: HashMap<String, String>,
+        previous: Option<&Self>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         config.validate()?;
         for (backend_id, endpoint) in &endpoint_overrides {
@@ -112,7 +143,10 @@ impl AppState {
                 .into());
             }
         }
-        let store = Store::open(&config.server.data_dir)?;
+        let store = match previous {
+            Some(old) => old.store.clone(),
+            None => Store::open(&config.server.data_dir)?,
+        };
         if config.backend("opencode-go").is_some() && config.backend("open-code-go").is_none() {
             let migrated = store.rename_backend("open-code-go", "opencode-go")?;
             if migrated > 0 {
@@ -135,13 +169,28 @@ impl AppState {
         let legacy_singleton_go_target = (opencode_go_targets.len() == 1)
             .then(|| opencode_go_targets.iter().next().cloned())
             .flatten();
-        let affinity =
-            AffinityDirectory::new(config.affinity.clone()).map_err(std::io::Error::other)?;
+        let affinity = if let Some(old) = previous.filter(|old| {
+            serde_json::to_value(&old.config.affinity).unwrap()
+                == serde_json::to_value(&config.affinity).unwrap()
+        }) {
+            old.affinity.clone()
+        } else {
+            Arc::new(
+                AffinityDirectory::new(config.affinity.clone()).map_err(std::io::Error::other)?,
+            )
+        };
+        let admission = previous
+            .map(|old| old.admission.clone())
+            .unwrap_or_default();
+        if previous.is_none() {
+            admission.publish_config(&config);
+        }
         let mut targets = HashMap::new();
         for served_model in &config.models {
             for layer in &served_model.layers {
                 for target in &layer.targets {
                     if let Entry::Vacant(entry) = targets.entry(target.clone()) {
+                        let identity = target_identity(&config, target);
                         let backend = config
                             .backend(&target.backend)
                             .expect("validated route backend");
@@ -149,6 +198,30 @@ impl AppState {
                             .credential(&target.credential)
                             .expect("validated route credential");
                         let model = backend.model(&target.model).expect("validated route model");
+                        if let Some(old) =
+                            previous
+                                .and_then(|old| old.targets.get(target))
+                                .filter(|old| {
+                                    old.identity == identity
+                                        && old.pool == credential.pool
+                                        && previous.is_some_and(|p| {
+                                            serde_json::to_value(p.config.server.timeouts).unwrap()
+                                                == serde_json::to_value(config.server.timeouts)
+                                                    .unwrap()
+                                                && p.config
+                                                    .backend(&target.backend)
+                                                    .and_then(|b| b.model(&target.model))
+                                                    .is_some_and(|m| {
+                                                        m.pricing == model.pricing
+                                                            && m.pricing_schedule
+                                                                == model.pricing_schedule
+                                                    })
+                                        })
+                                })
+                        {
+                            entry.insert(old.clone());
+                            continue;
+                        }
                         #[cfg(feature = "test-support")]
                         let client = BackendClient::new_with_endpoint_override(
                             backend,
@@ -171,41 +244,107 @@ impl AppState {
                             "circuit:{}:{}:{}",
                             target.backend, target.credential, target.model
                         );
-                        let circuit_key = circuit_store_key(target);
-                        store.migrate_state_key(&legacy_circuit_key, &circuit_key)?;
-                        if legacy_singleton_go_target.as_ref() == Some(target) {
+                        let circuit_key = format!("{}:{}", circuit_store_key(target), identity);
+                        if previous.is_none() {
+                            store.migrate_state_key(&legacy_circuit_key, &circuit_key)?;
+                            store.migrate_state_key(&circuit_store_key(target), &circuit_key)?;
+                        }
+                        if previous.is_none() && legacy_singleton_go_target.as_ref() == Some(target)
+                        {
                             store.migrate_state_key("opencode-go-circuit", &circuit_key)?;
                             store.migrate_state_key("open-code-go-circuit", &circuit_key)?;
                         }
-                        let circuit = Arc::new(CircuitBreaker::load(store.clone(), circuit_key)?);
-                        entry.insert(Arc::new(TargetRuntime { client, circuit }));
+                        let circuit = if let Some(old) = previous
+                            .and_then(|old| old.targets.get(target))
+                            .filter(|old| old.identity == identity)
+                        {
+                            old.circuit.clone()
+                        } else {
+                            Arc::new(CircuitBreaker::load(store.clone(), circuit_key)?)
+                        };
+                        entry.insert(Arc::new(TargetRuntime {
+                            client,
+                            circuit,
+                            identity,
+                            account: crate::admission::account_key(&backend.id, &credential.id),
+                            pool: credential.pool.clone(),
+                        }));
                     }
                 }
             }
         }
+        let calendars = config
+            .models
+            .iter()
+            .map(|model| {
+                let calendar = crate::calendar::Calendar::new(
+                    &model.timezone,
+                    &model
+                        .layers
+                        .iter()
+                        .map(|layer| layer.name.clone())
+                        .collect::<Vec<_>>(),
+                    &model.schedules,
+                )
+                .expect("validated calendar");
+                (model.name.clone(), calendar)
+            })
+            .collect();
         Ok(Self {
+            calendars,
             config,
             store,
             targets,
             selector,
             affinity,
-            started_at_ms: Utc::now().timestamp_millis(),
+            admission,
+            started_at_ms: previous
+                .map(|old| old.started_at_ms)
+                .unwrap_or_else(|| Utc::now().timestamp_millis()),
         })
     }
 
-    pub fn start_background(self: &Arc<Self>) {
-        let affinity_state = self.clone();
-        tokio::spawn(async move {
+    pub(crate) async fn routing_rows(&self, at: chrono::DateTime<Utc>) -> Vec<Value> {
+        let mut models = Vec::new();
+        for model in &self.config.models {
+            let names = model
+                .layers
+                .iter()
+                .map(|l| l.name.clone())
+                .collect::<Vec<_>>();
+            let selected = self.calendars[&model.name].at(at);
+            let mut layers = Vec::new();
+            for (index, layer) in model.layers.iter().enumerate() {
+                let mut targets = Vec::new();
+                for target in &layer.targets {
+                    let runtime = &self.targets[target];
+                    let pool = runtime
+                        .pool
+                        .as_ref()
+                        .and_then(|id| self.admission.snapshot(id));
+                    targets.push(json!({"backend":target.backend,"credential":target.credential,"upstream_model":target.model,
+                        "circuit":runtime.circuit.snapshot().await,"pool":runtime.pool,
+                        "in_flight":pool.as_ref().map(|p|p.in_flight),"max_in_flight":pool.as_ref().map(|p|p.max_in_flight)}));
+                }
+                layers.push(json!({"index":index,"name":layer.name,"strategy":layer.strategy,"targets":targets}));
+            }
+            models.push(json!({"name":model.name,"aliases":model.aliases,"active_schedule":selected.active_schedule,
+                "effective_order":selected.order.iter().map(|i|&names[*i]).collect::<Vec<_>>(),"layers":layers}));
+        }
+        models
+    }
+
+    pub fn start_background(self: &Arc<Self>) -> Vec<tokio::task::JoinHandle<()>> {
+        let affinity_state = self.affinity.clone();
+        let affinity_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
                 interval.tick().await;
-                affinity_state
-                    .affinity
-                    .expire(Utc::now().timestamp_millis());
+                affinity_state.expire(Utc::now().timestamp_millis());
             }
         });
         let stats_store = self.store.clone();
-        tokio::spawn(async move {
+        let stats_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(3600));
             interval.tick().await;
             loop {
@@ -218,7 +357,27 @@ impl AppState {
                 }
             }
         });
+        vec![affinity_task, stats_task]
     }
+}
+
+pub(crate) fn target_identity(config: &Config, target: &RouteTargetConfig) -> String {
+    let backend = config.backend(&target.backend).expect("validated backend");
+    let bytes = serde_json::to_vec(&(
+        target,
+        backend.adapter,
+        &backend.endpoint,
+        &backend
+            .credential(&target.credential)
+            .expect("validated credential")
+            .api_key,
+        &backend
+            .model(&target.model)
+            .expect("validated model")
+            .protocols,
+    ))
+    .unwrap();
+    blake3::hash(&bytes).to_hex().to_string()
 }
 
 fn circuit_store_key(target: &RouteTargetConfig) -> String {
@@ -266,6 +425,7 @@ async fn api_not_found() -> StatusCode {
 async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({
         "status":"ok",
+        "version":env!("CARGO_PKG_VERSION"),
         "models":state.config.models.iter().map(|model|model.name.as_str()).collect::<Vec<_>>(),
         "uptime_seconds":(Utc::now().timestamp_millis()-state.started_at_ms)/1000
     }))
@@ -455,6 +615,8 @@ struct RouteCandidate {
     target: RouteTargetConfig,
     layer_name: String,
     layer_index: usize,
+    priority_rank: usize,
+    active_schedule: Option<String>,
     selection_reason: String,
     matched_prefix_bytes: Option<u64>,
     affinity_path: Option<FingerprintPath>,
@@ -469,7 +631,9 @@ fn route_candidates(
     original: &Value,
 ) -> Vec<RouteCandidate> {
     let mut candidates = Vec::new();
-    for (layer_index, layer) in model.layers.iter().enumerate() {
+    let selection = state.calendars[&model.name].at(Utc::now());
+    for (priority_rank, layer_index) in selection.order.into_iter().enumerate() {
+        let layer = &model.layers[layer_index];
         let order = state.selector.order(layer.targets.len());
         let selection_reason = if layer.targets.len() == 1 {
             "single-target"
@@ -483,6 +647,8 @@ fn route_candidates(
                 target,
                 layer_name: layer.name.clone(),
                 layer_index,
+                priority_rank,
+                active_schedule: selection.active_schedule.clone(),
                 selection_reason: selection_reason.into(),
                 matched_prefix_bytes: None,
                 affinity_path: None,
@@ -547,7 +713,7 @@ fn affinity_context(
             target.model,
             egress.as_str()
         ),
-        generation: "configured-target-v1".into(),
+        generation: runtime.identity.clone(),
     };
     Some((path, domain))
 }
@@ -687,6 +853,13 @@ async fn handle_nonstream(
             }
             let mut candidate = candidate_template.clone();
             let runtime = target_runtime(&state, &candidate.target);
+            let Some(_capacity) = state
+                .admission
+                .acquire_account(&runtime.account, runtime.pool.as_deref())
+            else {
+                fallback_reason.get_or_insert(FailureClass::LocalCapacity);
+                continue;
+            };
             let permit = match runtime.circuit.decide().await {
                 RouteDecision::Primary { permit } => {
                     attempted.insert(candidate.target.clone());
@@ -791,6 +964,11 @@ async fn handle_nonstream(
             fallback_reason,
         )
         .await;
+        if fallback_reason == Some(FailureClass::LocalCapacity) {
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+        }
         if probe_wait_timed_out {
             apply_probe_retry_after(
                 &mut response,
@@ -822,7 +1000,7 @@ async fn handle_nonstream(
         route_layer_index: Some(outcome.candidate.layer_index),
         selection_reason: Some(outcome.candidate.selection_reason.clone()),
         matched_prefix_bytes: outcome.candidate.matched_prefix_bytes,
-        fallback: Some(outcome.candidate.layer_index > 0),
+        fallback: Some(outcome.candidate.priority_rank > 0),
         fallback_exhausted: false,
         translated: outcome.translated,
         request_bytes,
@@ -1009,7 +1187,10 @@ async fn execute_json_attempt(
         raw.clone()
     };
     let usage = usage_for(egress, &raw);
-    let cost = provider_cost(runtime.client.pricing(), &usage);
+    let rates = runtime.client.pricing_at(
+        chrono::DateTime::from_timestamp_millis(started_at_ms).expect("valid attempt timestamp"),
+    );
+    let cost = provider_cost(rates.as_ref(), &usage);
     let record = AttemptRecord {
         id: attempt_id,
         request_id: Some(request_id.into()),
@@ -1090,6 +1271,13 @@ async fn handle_stream(
                 .get(&candidate.target)
                 .expect("validated runtime target")
                 .clone();
+            let Some(capacity) = state
+                .admission
+                .acquire_account(&runtime.account, runtime.pool.as_deref())
+            else {
+                fallback_reason.get_or_insert(FailureClass::LocalCapacity);
+                continue;
+            };
             let permit = match runtime.circuit.decide().await {
                 RouteDecision::Primary { permit } => {
                     attempted.insert(candidate.target.clone());
@@ -1123,6 +1311,7 @@ async fn handle_stream(
                     Ok(mut success) => {
                         success.fallback_reason = fallback_reason;
                         success.permit = Some(permit);
+                        success.capacity = Some(capacity);
                         prepared = Some(success);
                         break 'routing;
                     }
@@ -1189,6 +1378,11 @@ async fn handle_stream(
             fallback_reason,
         )
         .await;
+        if fallback_reason == Some(FailureClass::LocalCapacity) {
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+        }
         if probe_wait_timed_out {
             apply_probe_retry_after(
                 &mut response,
@@ -1224,14 +1418,19 @@ async fn handle_stream(
     let upstream_request_bytes = prepared.request_bytes;
     let upstream_status = prepared.status;
     let upstream_model = prepared.runtime.client.model().to_string();
-    let upstream_pricing = prepared.runtime.client.pricing().copied();
+    let upstream_pricing = prepared.runtime.client.pricing_at(
+        chrono::DateTime::from_timestamp_millis(attempt_started_at_ms)
+            .expect("valid attempt timestamp"),
+    );
     let provider_client = prepared.runtime.client.clone();
     let downstream_sse_heartbeat_ms = state.config.server.timeouts.downstream_sse_heartbeat_ms;
     let permit = prepared
         .permit
         .expect("route permit attached after prepare");
     let candidate_for_stream = candidate.clone();
+    let capacity = prepared.capacity;
     let stream = stream! {
+        let _capacity = capacity;
         let mut response_bytes = 0_u64;
         let mut usage = Usage::default();
         let mut stream_error = None;
@@ -1404,7 +1603,7 @@ async fn handle_stream(
             route_layer_index:Some(candidate_for_stream.layer_index),
             selection_reason:Some(candidate_for_stream.selection_reason.clone()),
             matched_prefix_bytes:candidate_for_stream.matched_prefix_bytes,
-            fallback:Some(candidate_for_stream.layer_index>0),
+            fallback:Some(candidate_for_stream.priority_rank>0),
             fallback_exhausted:false,
             translated,
             request_bytes,
@@ -1492,6 +1691,7 @@ struct PreparedStream {
     status: StatusCode,
     fallback_reason: Option<FailureClass>,
     permit: Option<CircuitPermit>,
+    capacity: Option<crate::admission::Lease>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1676,6 +1876,7 @@ async fn prepare_stream_attempt(
         status,
         fallback_reason: None,
         permit: None,
+        capacity: None,
     })
 }
 
@@ -1805,7 +2006,7 @@ async fn terminal_failure(
         route_layer_index: candidate.map(|candidate| candidate.layer_index),
         selection_reason: candidate.map(|candidate| candidate.selection_reason.clone()),
         matched_prefix_bytes: candidate.and_then(|candidate| candidate.matched_prefix_bytes),
-        fallback: candidate.map(|candidate| candidate.layer_index > 0),
+        fallback: candidate.map(|candidate| candidate.priority_rank > 0),
         fallback_exhausted,
         translated: false,
         request_bytes,
@@ -2041,6 +2242,17 @@ fn apply_metadata(
         ("x-relay-credential", candidate.target.credential.clone()),
         ("x-relay-route-layer", candidate.layer_name.clone()),
         (
+            "x-relay-priority-rank",
+            (candidate.priority_rank + 1).to_string(),
+        ),
+        (
+            "x-relay-schedule",
+            candidate
+                .active_schedule
+                .clone()
+                .unwrap_or_else(|| "default".into()),
+        ),
+        (
             "x-relay-route-layer-index",
             candidate.layer_index.to_string(),
         ),
@@ -2051,7 +2263,7 @@ fn apply_metadata(
         ("x-relay-upstream-model", model.into()),
         (
             "x-relay-fallback",
-            if candidate.layer_index > 0 {
+            if candidate.priority_rank > 0 {
                 "1".into()
             } else {
                 "0".into()
@@ -2083,6 +2295,7 @@ fn apply_metadata(
 struct RequestPageQuery {
     limit: Option<usize>,
     before: Option<String>,
+    model: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2094,7 +2307,24 @@ async fn requests(
     Query(query): Query<RequestPageQuery>,
 ) -> Response {
     let limit = query.limit.unwrap_or(100).min(1000);
-    match state.store.request_page(limit, query.before.as_deref()) {
+    let page = if let Some(name) = query.model.as_deref() {
+        let Some(model) = state.config.resolve_model(name) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":"unknown served model","code":"unknown_model"})),
+            )
+                .into_response();
+        };
+        let names = std::iter::once(model.name.as_str())
+            .chain(model.aliases.iter().map(String::as_str))
+            .collect::<Vec<_>>();
+        state
+            .store
+            .request_page_for_model(limit, query.before.as_deref(), &names)
+    } else {
+        state.store.request_page(limit, query.before.as_deref())
+    };
+    match page {
         Ok(page) => Json(json!({
             "requests":page.requests,
             "next_cursor":page.next_cursor,
@@ -2120,33 +2350,7 @@ async fn attempts(State(state): State<Arc<AppState>>, Query(query): Query<LimitQ
 }
 
 async fn routing(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let mut models = Vec::with_capacity(state.config.models.len());
-    for model in &state.config.models {
-        let mut layers = Vec::with_capacity(model.layers.len());
-        for (layer_index, layer) in model.layers.iter().enumerate() {
-            let mut targets = Vec::with_capacity(layer.targets.len());
-            for target in &layer.targets {
-                targets.push(json!({
-                    "backend": target.backend,
-                    "credential": target.credential,
-                    "upstream_model": target.model,
-                    "circuit": target_runtime(&state, target).circuit.snapshot().await,
-                }));
-            }
-            layers.push(json!({
-                "index": layer_index,
-                "name": layer.name,
-                "strategy": layer.strategy.as_str(),
-                "targets": targets,
-            }));
-        }
-        models.push(json!({
-            "name": model.name,
-            "aliases": model.aliases,
-            "layers": layers,
-        }));
-    }
-    Json(json!({"models": models}))
+    Json(json!({"models":state.routing_rows(Utc::now()).await}))
 }
 
 #[derive(Deserialize)]

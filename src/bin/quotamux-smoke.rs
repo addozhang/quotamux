@@ -65,13 +65,7 @@ async fn chat(client: &reqwest::Client, base: &str, model: &str) -> Result<Strin
             .is_some_and(|v| !v.is_empty()),
         "chat content missing",
     )?;
-    ensure(
-        message
-            .get("reasoning_content")
-            .and_then(Value::as_str)
-            .is_some_and(|v| !v.is_empty()),
-        "chat reasoning_content missing",
-    )?;
+    ensure(has_chat_reasoning(message), "chat reasoning missing")?;
     ensure(value.get("usage").is_some(), "chat usage missing")?;
     println!("PASS chat + reasoning + usage");
     Ok(backend)
@@ -94,9 +88,8 @@ async fn chat_stream(client: &reqwest::Client, base: &str, model: &str) -> Resul
         }
         let value: Value = serde_json::from_str(&event.data)?;
         reasoning |= value
-            .pointer("/choices/0/delta/reasoning_content")
-            .and_then(Value::as_str)
-            .is_some_and(|v| !v.is_empty());
+            .pointer("/choices/0/delta")
+            .is_some_and(has_chat_reasoning);
         content |= value
             .pointer("/choices/0/delta/content")
             .and_then(Value::as_str)
@@ -121,13 +114,7 @@ async fn tool_roundtrip(client: &reqwest::Client, base: &str, model: &str) -> Re
         .pointer("/choices/0/message")
         .cloned()
         .ok_or("tool assistant message missing")?;
-    ensure(
-        assistant
-            .get("reasoning_content")
-            .and_then(Value::as_str)
-            .is_some_and(|v| !v.is_empty()),
-        "tool reasoning_content missing",
-    )?;
+    ensure(has_chat_reasoning(&assistant), "tool reasoning missing")?;
     let call_id = assistant
         .pointer("/tool_calls/0/id")
         .and_then(Value::as_str)
@@ -355,4 +342,13 @@ fn parse_event(frame: &[u8]) -> Option<Event> {
             data: data.join("\n"),
         })
     }
+}
+
+fn has_chat_reasoning(message: &Value) -> bool {
+    ["reasoning_content", "reasoning"].iter().any(|key| {
+        message
+            .get(*key)
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty())
+    })
 }

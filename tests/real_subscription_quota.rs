@@ -62,6 +62,8 @@ async fn run_quota_probe(kind: AdapterKind, max_attempts: usize) {
         timeouts: config.server.timeouts,
     };
     config.models = vec![ServedModelConfig {
+        timezone: "UTC".into(),
+        schedules: vec![],
         name: PROBE_MODEL.into(),
         aliases: Vec::new(),
         protocols: vec![Protocol::OpenAiChat],

@@ -1,6 +1,6 @@
-# QuotaMux version-three layered routing configuration.
+# QuotaMux version-four routing workspace configuration.
 # Copy this file to quotamux.toml and keep the populated file private.
-config_version = 3
+config_version = 4
 
 [server]
 # Docker publishes this port on 127.0.0.1; QuotaMux listens on all container
@@ -45,21 +45,69 @@ api_key = ""
 [[backends.models]]
 name = "deepseek-v4-flash"
 # The OpenCode Go adapter owns this official model's endpoint family.
-# Static cost estimates use current off-peak rates; peak rates are 2x.
+# Published default and weekday peak usage rates, checked 2026-09-07.
 pricing = { cache_hit_input_usd_per_million = 0.007, cache_miss_input_usd_per_million = 0.22, output_usd_per_million = 0.66 }
+pricing_note = "Subscription allowance value; not a cash invoice."
+pricing_source = "https://opencode.ai/docs/go/"
+[backends.models.pricing_schedule]
+timezone = "UTC"
+[[backends.models.pricing_schedule.windows]]
+name = "Weekday morning peak"
+days = [1, 2, 3, 4, 5]
+start = "01:00"
+end = "04:00"
+pricing = { cache_hit_input_usd_per_million = 0.014, cache_miss_input_usd_per_million = 0.44, output_usd_per_million = 1.32 }
+[[backends.models.pricing_schedule.windows]]
+name = "Weekday afternoon peak"
+days = [1, 2, 3, 4, 5]
+start = "06:00"
+end = "10:00"
+pricing = { cache_hit_input_usd_per_million = 0.014, cache_miss_input_usd_per_million = 0.44, output_usd_per_million = 1.32 }
 
 [[backends.models]]
 name = "deepseek-v4-flash-vision-exp"
 pricing = { cache_hit_input_usd_per_million = 0.007, cache_miss_input_usd_per_million = 0.22, output_usd_per_million = 0.66 }
+pricing_note = "Subscription allowance value; not a cash invoice."
+pricing_source = "https://opencode.ai/docs/go/"
+[backends.models.pricing_schedule]
+timezone = "UTC"
+[[backends.models.pricing_schedule.windows]]
+name = "Weekday morning peak"
+days = [1, 2, 3, 4, 5]
+start = "01:00"
+end = "04:00"
+pricing = { cache_hit_input_usd_per_million = 0.014, cache_miss_input_usd_per_million = 0.44, output_usd_per_million = 1.32 }
+[[backends.models.pricing_schedule.windows]]
+name = "Weekday afternoon peak"
+days = [1, 2, 3, 4, 5]
+start = "06:00"
+end = "10:00"
+pricing = { cache_hit_input_usd_per_million = 0.014, cache_miss_input_usd_per_million = 0.44, output_usd_per_million = 1.32 }
 
 [[backends.models]]
 name = "deepseek-v4-pro"
 pricing = { cache_hit_input_usd_per_million = 0.022, cache_miss_input_usd_per_million = 0.66, output_usd_per_million = 1.98 }
+pricing_note = "Subscription allowance value; not a cash invoice."
+pricing_source = "https://opencode.ai/docs/go/"
+[backends.models.pricing_schedule]
+timezone = "UTC"
+[[backends.models.pricing_schedule.windows]]
+name = "Weekday morning peak"
+days = [1, 2, 3, 4, 5]
+start = "01:00"
+end = "04:00"
+pricing = { cache_hit_input_usd_per_million = 0.044, cache_miss_input_usd_per_million = 1.32, output_usd_per_million = 3.96 }
+[[backends.models.pricing_schedule.windows]]
+name = "Weekday afternoon peak"
+days = [1, 2, 3, 4, 5]
+start = "06:00"
+end = "10:00"
+pricing = { cache_hit_input_usd_per_million = 0.044, cache_miss_input_usd_per_million = 1.32, output_usd_per_million = 3.96 }
 
 [[backends.models]]
 # OpenCode Go GLM-5.3-Flash has a 1M-token multimodal context window.
 name = "glm-5.3-flash"
-pricing = { cache_hit_input_usd_per_million = 0.01, cache_miss_input_usd_per_million = 0.07, output_usd_per_million = 0.25 }
+pricing = { cache_hit_input_usd_per_million = 0.03, cache_miss_input_usd_per_million = 0.15, output_usd_per_million = 0.50 }
 
 [[backends]]
 id = "zhipu-coding-plan"
@@ -99,16 +147,64 @@ api_key = ""
 name = "deepseek-v4-flash"
 protocols = ["openai-chat", "openai-responses", "anthropic-messages"]
 pricing = { cache_hit_input_usd_per_million = 0.007, cache_miss_input_usd_per_million = 0.22, output_usd_per_million = 0.66 }
+pricing_note = "Published USD pay-as-you-go usage estimate."
+pricing_source = "https://api-docs.deepseek.com/quick_start/pricing/"
+[backends.models.pricing_schedule]
+timezone = "UTC"
+[[backends.models.pricing_schedule.windows]]
+name = "Weekday morning peak"
+days = [1, 2, 3, 4, 5]
+start = "01:00"
+end = "04:00"
+pricing = { cache_hit_input_usd_per_million = 0.014, cache_miss_input_usd_per_million = 0.44, output_usd_per_million = 1.32 }
+[[backends.models.pricing_schedule.windows]]
+name = "Weekday afternoon peak"
+days = [1, 2, 3, 4, 5]
+start = "06:00"
+end = "10:00"
+pricing = { cache_hit_input_usd_per_million = 0.014, cache_miss_input_usd_per_million = 0.44, output_usd_per_million = 1.32 }
 
 [[backends.models]]
 name = "deepseek-v4-flash-vision-exp"
 protocols = ["openai-chat", "openai-responses", "anthropic-messages"]
 pricing = { cache_hit_input_usd_per_million = 0.007, cache_miss_input_usd_per_million = 0.22, output_usd_per_million = 0.66 }
+pricing_note = "Published USD pay-as-you-go usage estimate."
+pricing_source = "https://api-docs.deepseek.com/quick_start/pricing/"
+[backends.models.pricing_schedule]
+timezone = "UTC"
+[[backends.models.pricing_schedule.windows]]
+name = "Weekday morning peak"
+days = [1, 2, 3, 4, 5]
+start = "01:00"
+end = "04:00"
+pricing = { cache_hit_input_usd_per_million = 0.014, cache_miss_input_usd_per_million = 0.44, output_usd_per_million = 1.32 }
+[[backends.models.pricing_schedule.windows]]
+name = "Weekday afternoon peak"
+days = [1, 2, 3, 4, 5]
+start = "06:00"
+end = "10:00"
+pricing = { cache_hit_input_usd_per_million = 0.014, cache_miss_input_usd_per_million = 0.44, output_usd_per_million = 1.32 }
 
 [[backends.models]]
 name = "deepseek-v4-pro"
 protocols = ["openai-chat", "openai-responses", "anthropic-messages"]
 pricing = { cache_hit_input_usd_per_million = 0.022, cache_miss_input_usd_per_million = 0.66, output_usd_per_million = 1.98 }
+pricing_note = "Published USD pay-as-you-go usage estimate."
+pricing_source = "https://api-docs.deepseek.com/quick_start/pricing/"
+[backends.models.pricing_schedule]
+timezone = "UTC"
+[[backends.models.pricing_schedule.windows]]
+name = "Weekday morning peak"
+days = [1, 2, 3, 4, 5]
+start = "01:00"
+end = "04:00"
+pricing = { cache_hit_input_usd_per_million = 0.044, cache_miss_input_usd_per_million = 1.32, output_usd_per_million = 3.96 }
+[[backends.models.pricing_schedule.windows]]
+name = "Weekday afternoon peak"
+days = [1, 2, 3, 4, 5]
+start = "06:00"
+end = "10:00"
+pricing = { cache_hit_input_usd_per_million = 0.044, cache_miss_input_usd_per_million = 1.32, output_usd_per_million = 3.96 }
 
 # QuotaMux owns this public model name and its explicit compatibility alias.
 [[models]]

@@ -3,9 +3,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "vite build && node scripts/precompress.mjs dist"
+    "build": "vite build && node scripts/precompress.mjs dist",
+    "test:e2e": "node tests/workspace.e2e.mjs"
   },
   "devDependencies": {
+    "@playwright/test": "1.63.0",
     "vite": "8.1.5"
   }
 }
