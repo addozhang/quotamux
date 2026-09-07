@@ -16,7 +16,7 @@ const state = {
   revision: null,
   selected: "all",
   view: "statistics",
-  accounts: false,
+  page: "workspace",
   accountTab: null,
   editing: false,
   dirty: false,
@@ -40,6 +40,7 @@ const browseActions = new Set([
   "enable-edit",
   "disable-edit",
   "accounts",
+  "settings",
   "account-tab",
   "workspace",
   "select",
@@ -91,7 +92,7 @@ function render() {
     return;
   }
   const model = state.draft.models[state.selected];
-  app.innerHTML = `<header><strong>QuotaMux</strong><span>Routing workspace</span><div class="header-actions">${button("workspace", "Workspace", "", `aria-current="${!state.accounts ? "page" : "false"}"`)}${button("accounts", "Accounts", "", `aria-current="${state.accounts ? "page" : "false"}"`)}${button(state.editing ? "disable-edit" : "enable-edit", state.editing ? "Disable edit" : "Enable edit")}</div></header><div id="notice" role="status" aria-live="polite">${esc(state.message)}</div><div id="migration-notice" role="status">${migrationMessage()}</div>${state.accounts ? accounts() : `<div class="workspace"><aside class="model-rail"><h2>Models</h2>${button("select", "All", "all", `aria-current="${state.selected === "all" ? "page" : "false"}"`)}${state.draft.models.map((m, i) => button("select", m.name || "New model", String(i), `aria-current="${i === state.selected ? "page" : "false"}"`)).join("")}${state.editing ? button("add-model", "+ Add model") : ""}<p class="muted">${state.live?.now ? "Live status " + esc(new Date(state.live.now).toLocaleTimeString()) : ""}</p></aside><main><nav class="child-nav" aria-label="Model views">${(state.selected === "all" ? ["statistics", "history"] : ["routing", "statistics", "history"]).map((v) => button("view", v[0].toUpperCase() + v.slice(1), v, `aria-pressed="${state.view === v}"`)).join("")}</nav>${state.view === "routing" ? (model ? modelEditor(model) : "<h1>Add your first model</h1>") : childView()}</main></div>`}${state.editing ? `<footer><span id="draft-status">${state.dirty ? "Unsaved changes" : "All changes saved"}</span><span>Save validates upstreams and immediately updates routing.</span>${button("discard", "Discard", "", state.busy ? "disabled" : "")}${button("save", state.busy ? "Validating and saving…" : "Save", "", `data-testid="save-workspace" ${state.busy || !state.editing ? "disabled" : ""}`)}</footer>` : ""}`;
+  app.innerHTML = `<header><strong>QuotaMux</strong><span>Routing workspace</span><div class="header-actions">${button("workspace", "Workspace", "", `aria-current="${state.page === "workspace" ? "page" : "false"}"`)}${button("accounts", "Accounts", "", `aria-current="${state.page === "accounts" ? "page" : "false"}"`)}${button("settings", "Settings", "", `aria-current="${state.page === "settings" ? "page" : "false"}"`)}${button(state.editing ? "disable-edit" : "enable-edit", state.editing ? "Disable edit" : "Enable edit")}</div></header><div id="notice" role="status" aria-live="polite">${esc(state.message)}</div><div id="migration-notice" role="status">${migrationMessage()}</div>${state.page === "settings" ? `<main class="accounts-page" aria-label="Settings"><h1>Settings</h1>${advanced()}</main>` : state.page === "accounts" ? accounts() : `<div class="workspace"><aside class="model-rail"><h2>Models</h2>${button("select", "All", "all", `aria-current="${state.selected === "all" ? "page" : "false"}"`)}${state.draft.models.map((m, i) => button("select", m.name || "New model", String(i), `aria-current="${i === state.selected ? "page" : "false"}"`)).join("")}${state.editing ? button("add-model", "+ Add model") : ""}<p class="muted">${state.live?.now ? "Live status " + esc(new Date(state.live.now).toLocaleTimeString()) : ""}</p></aside><main><nav class="child-nav" aria-label="Model views">${(state.selected === "all" ? ["statistics", "history"] : ["routing", "statistics", "history"]).map((v) => button("view", v[0].toUpperCase() + v.slice(1), v, `aria-pressed="${state.view === v}"`)).join("")}</nav>${state.view === "routing" ? (model ? modelEditor(model) : "<h1>Add your first model</h1>") : childView()}</main></div>`}${state.editing ? `<footer><span id="draft-status">${state.dirty ? "Unsaved changes" : "All changes saved"}</span><span>Save validates upstreams and immediately updates routing.</span>${button("discard", "Discard", "", state.busy ? "disabled" : "")}${button("save", state.busy ? "Validating and saving…" : "Save", "", `data-testid="save-workspace" ${state.busy || !state.editing ? "disabled" : ""}`)}</footer>` : ""}`;
   if (state.busy)
     app
       .querySelectorAll("input,select,button")
@@ -103,6 +104,13 @@ function render() {
     app.querySelectorAll("[data-action]").forEach((node) => {
       if (!browseActions.has(node.dataset.action)) node.disabled = true;
     });
+  }
+  const selectedTab = app.querySelector('.account-tabs [aria-selected="true"]');
+  if (selectedTab) {
+    const tabs = selectedTab.parentElement;
+    const bounds = tabs.getBoundingClientRect(), selected = selectedTab.getBoundingClientRect();
+    if (selected.right > bounds.right) tabs.scrollLeft += selected.right - bounds.right;
+    else if (selected.left < bounds.left) tabs.scrollLeft += selected.left - bounds.left;
   }
   updateLive();
 }
@@ -144,28 +152,28 @@ function modelEditor(m) {
     )}<div class="preview"><h3>Preview saved policy</h3><p class="muted">Read-only preview uses the currently saved rules, not unsaved edits.</p><label><span>Instant (RFC3339 with timezone)</span><input id="preview-at" value="${esc(state.at)}" placeholder="2026-09-07T12:00:00Z"></label>${button("preview", "Preview saved order")}<div id="preview-result">${state.preview ? esc(state.preview) : ""}</div></div></section>`;
 }
 function normalizeAccountTab() {
-  if (state.accountTab === "pools" || state.accountTab === "runtime") return;
   const index = Number(state.accountTab?.split(":")[1]);
   if (state.accountTab?.startsWith("backend:") && state.draft.backends[index]) return;
-  state.accountTab = state.draft.backends.length ? "backend:0" : "pools";
+  state.accountTab = state.draft.backends.length ? "backend:0" : null;
 }
 function accounts() {
   normalizeAccountTab();
-  const tabs = [...state.draft.backends.map((backend, index) => [`backend:${index}`, displayName(backend.id || "New account")]), ["pools", "Shared capacity"], ["runtime", "Runtime settings"]];
-  const index = Number(state.accountTab.split(":")[1]);
-  const panel = state.accountTab === "pools" ? capacityPanel() : state.accountTab === "runtime" ? advanced() : state.editing ? accountEditor(state.draft.backends[index], index) : accountSummary(state.draft.backends[index]);
-  return `<main class="accounts-page" aria-label="Accounts"><div class="heading"><h1>Accounts</h1>${state.editing ? button("add-backend", "+ Add account") : ""}</div><nav class="account-tabs" role="tablist" aria-label="Account settings">${tabs.map(([id, label]) => button("account-tab", label, id, `role="tab" id="account-tab-${id}" aria-controls="account-panel" aria-selected="${state.accountTab === id}"`)).join("")}</nav><div role="tabpanel" id="account-panel" aria-labelledby="account-tab-${state.accountTab}">${panel}</div></main>`;
+  const tabs = state.draft.backends.map((backend, index) => [`backend:${index}`, displayName(backend.id || "New account")]);
+  const index = Number(state.accountTab?.split(":")[1]);
+  const backend = state.draft.backends[index];
+  const panel = backend ? (state.editing ? accountEditor(backend, index) : accountSummary(backend)) : '<p class="muted">No accounts configured.</p>';
+  return `<main class="accounts-page" aria-label="Accounts"><div class="heading"><h1>Accounts</h1>${state.editing ? button("add-backend", "+ Add account") : ""}</div><nav class="account-tabs" role="tablist" aria-label="Account settings">${tabs.map(([id, label]) => button("account-tab", label, id, `role="tab" id="account-tab-${id}" aria-controls="account-panel" aria-selected="${state.accountTab === id}"`)).join("")}</nav><div role="tabpanel" id="account-panel" ${state.accountTab ? `aria-labelledby="account-tab-${state.accountTab}"` : 'aria-label="Accounts"'}>${panel}</div></main>`;
 }
 function accountEditor(b, i) {
       const p = `backends.${i}`;
       return `<p class="muted">Credentials stay blank when loaded. Leave an existing key blank to preserve it.</p><article><h3 data-account-heading>${esc(displayName(b.id || "New account"))}</h3><div class="row">${field(p + ".id", "Account ID")}${field(p + ".adapter", "Adapter", "text", adapters)}</div>${b.adapter.startsWith("custom-") ? field(p + ".endpoint", "Endpoint URL (blank preserves existing)") : '<p class="muted">Official endpoint managed by adapter</p>'}<h4>Credentials</h4>${b.credentials
         .map((c, j) => {
           const q = `${p}.credentials.${j}`;
-          return `<div class="credential"><div class="row">${field(q + ".id", "Credential ID")}${field(q + ".api_key", "API key (blank preserves existing)", "password")}${field(q + ".pool", "Shared pool", "text", ["", ...(state.draft.capacity_pools || []).map((p) => p.id)])}</div>${button("remove", "Delete credential", q)}</div>`;
+          return `<div class="credential"><div class="row">${field(q + ".id", "Credential ID")}${field(q + ".api_key", "API key (blank preserves existing)", "password")}${field(q + ".pool", "Shared pool", "text", ["", ...(state.draft.capacity_pools || []).map((p) => p.id)])}</div>${!c.pool ? button("add-pool", "Create capacity pool", q) : ""}${button("remove", "Delete credential", q)}</div>`;
         })
         .join(
           "",
-        )}${button("add-credential", "+ Add credential", p + ".credentials")}<h4>Upstream models</h4>${b.models
+        )}${button("add-credential", "+ Add credential", p + ".credentials")}${capacityPanel(b)}<h4>Upstream models</h4>${b.models
         .map((m, j) => {
           const q = `${p}.models.${j}`;
           return `<fieldset><legend>Upstream model</legend>${field(q + ".name", "Upstream model name")}${choices(
@@ -191,12 +199,17 @@ function rateSummary(rates) {
 }
 function accountSummary(backend) {
   const dayNames = ["", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-  return `<article><h2>${esc(displayName(backend.id))}</h2>${infoRows([["Adapter", displayName(backend.adapter)], ["Endpoint", backend.adapter.startsWith("custom-") ? backend.endpoint || "Saved endpoint is redacted" : "Official endpoint managed by adapter"]])}<h3>Credentials</h3>${backend.credentials.length ? `<div class="table-scroll"><table><thead><tr><th>Credential</th><th>Shared capacity</th></tr></thead><tbody>${backend.credentials.map(credential => `<tr><td>${esc(credential.id)}</td><td data-pool-status="${esc(credential.pool || "")}" ${credential.pool ? `data-live-pool="${esc(credential.pool)}"` : ""}>${esc(poolText(credential.pool))}</td></tr>`).join("")}</tbody></table></div>` : '<p class="muted">No credentials configured.</p>'}</article><h2>Upstream models</h2>${backend.models.map(model => `<article><h3>${esc(model.name)}</h3>${infoRows([["Supported protocols", model.protocols?.length ? model.protocols.join(", ") : "Adapter defaults"], ["Billing context", model.pricing_note || "Not configured"], ["Rate reference", model.pricing_source || "Not configured"], ["Default rates", rateSummary(model.pricing)]])}<h4>Active rates</h4><p data-price-backend="${esc(backend.id)}" data-price-model="${esc(model.name)}">${esc(activePriceText(state.live?.pricing?.find(row => row.backend === backend.id && row.model === model.name)))}</p><p class="muted">Usage value is an estimate, not an actual cash bill. Subscription requests may consume quota.</p>${model.pricing_schedule ? `<h4>Weekly price windows · ${esc(model.pricing_schedule.timezone)}</h4><div class="table-scroll"><table><thead><tr><th>Window</th><th>Starting days</th><th>Start</th><th>End</th><th>Rates (USD / million tokens)</th></tr></thead><tbody>${model.pricing_schedule.windows.map(window => `<tr><td>${esc(window.name)}</td><td>${esc(window.days.map(day => dayNames[day] || day).join(", "))}</td><td>${esc(window.start)}</td><td>${esc(window.end)}</td><td>${esc(rateSummary(window.pricing))}</td></tr>`).join("")}</tbody></table></div>` : ""}</article>`).join("") || '<p class="muted">No upstream models configured.</p>'}`;
+  return `<article><h2>${esc(displayName(backend.id))}</h2>${infoRows([["Adapter", displayName(backend.adapter)], ["Endpoint", backend.adapter.startsWith("custom-") ? backend.endpoint || "Saved endpoint is redacted" : "Official endpoint managed by adapter"]])}<h3>Credentials</h3>${backend.credentials.length ? `<div class="table-scroll"><table><thead><tr><th>Credential</th><th>Shared capacity</th></tr></thead><tbody>${backend.credentials.map(credential => `<tr><td>${esc(credential.id)}</td><td >${esc(credential.pool || "No local limit")}</td></tr>`).join("")}</tbody></table></div>` : '<p class="muted">No credentials configured.</p>'}</article>${capacityPanel(backend)}<h2>Upstream models</h2>${backend.models.map(model => `<article><h3>${esc(model.name)}</h3>${infoRows([["Supported protocols", model.protocols?.length ? model.protocols.join(", ") : "Adapter defaults"], ["Billing context", model.pricing_note || "Not configured"], ["Rate reference", model.pricing_source || "Not configured"], ["Default rates", rateSummary(model.pricing)]])}<h4>Active rates</h4><p data-price-backend="${esc(backend.id)}" data-price-model="${esc(model.name)}">${esc(activePriceText(state.live?.pricing?.find(row => row.backend === backend.id && row.model === model.name)))}</p><p class="muted">Usage value is an estimate, not an actual cash bill. Subscription requests may consume quota.</p>${model.pricing_schedule ? `<h4>Weekly price windows · ${esc(model.pricing_schedule.timezone)}</h4><div class="table-scroll"><table><thead><tr><th>Window</th><th>Starting days</th><th>Start</th><th>End</th><th>Rates (USD / million tokens)</th></tr></thead><tbody>${model.pricing_schedule.windows.map(window => `<tr><td>${esc(window.name)}</td><td>${esc(window.days.map(day => dayNames[day] || day).join(", "))}</td><td>${esc(window.start)}</td><td>${esc(window.end)}</td><td>${esc(rateSummary(window.pricing))}</td></tr>`).join("")}</tbody></table></div>` : ""}</article>`).join("") || '<p class="muted">No upstream models configured.</p>'}`;
 }
-function capacityPanel() {
-  const pools = state.draft.capacity_pools || [];
-  if (!state.editing) return `<h2>Shared capacity</h2>${pools.length ? `<div class="table-scroll"><table><thead><tr><th>Pool</th><th>In flight / maximum</th><th>Configured maximum concurrent requests</th></tr></thead><tbody>${pools.map(pool => `<tr><td>${esc(pool.id)}</td><td data-pool-count="${esc(pool.id)}" data-live-pool="${esc(pool.id)}">${esc(poolText(pool.id))}</td><td>${esc(pool.max_in_flight)}</td></tr>`).join("")}</tbody></table></div>` : '<p class="muted">No shared capacity pools configured.</p>'}`;
-  return `<h2>Shared capacity</h2><p class="muted">Assign pools to credentials in each account. No pool means no local concurrency limit.</p>${pools.map((pool, i) => `<article><div class="row">${field(`capacity_pools.${i}.id`, "Pool ID")}${field(`capacity_pools.${i}.max_in_flight`, "Maximum concurrent requests", "number")}${button("remove", "Delete pool", `capacity_pools.${i}`)}</div></article>`).join("")}${button("add-pool", "+ Add pool")}`;
+function poolReferences(id) {
+  const pool = state.draft.capacity_pools.find(pool => pool.id === id);
+  const bound = draftPoolBindings.get(pool) || [];
+  return state.draft.backends.flatMap(backend => backend.credentials.filter(credential => (id && credential.pool === id) || bound.includes(credential)).map(credential => `${displayName(backend.id)} / ${credential.id}`));
+}
+function capacityPanel(backend) {
+  const ids = new Set(backend.credentials.map(credential => credential.pool).filter(Boolean));
+  const pools = state.draft.capacity_pools.map((pool, index) => ({pool, index})).filter(({pool}) => ids.has(pool.id) || draftPoolBindings.get(pool)?.some(credential => backend.credentials.includes(credential)));
+  return `<section><h3>Shared capacity</h3>${pools.length ? pools.map(({pool, index}) => `<article><p data-pool-index="${index}" data-pool-count="${esc(pool.id)}" data-live-pool="${esc(pool.id)}">${esc(poolText(pool.id))}</p><p class="muted" data-pool-references="${index}">Shared by: ${esc(poolReferences(pool.id).join(", "))}</p>${state.editing ? `<div class="row">${field(`capacity_pools.${index}.id`, "Pool ID")}${field(`capacity_pools.${index}.max_in_flight`, "Maximum concurrent requests", "number")}${button("remove", "Delete pool", `capacity_pools.${index}`)}</div>` : infoRows([["Pool", pool.id], ["Maximum concurrent requests", pool.max_in_flight]])}</article>`).join("") : '<p class="muted">No local limit. No capacity pools assigned to this account.</p>'}</section>`;
 }
 const windows = [
   ["1h", "1 hour"],
@@ -298,7 +311,7 @@ function globalStatistics() {
 }
 function updateLive() {
   document.querySelectorAll("[data-pool-status]").forEach(node => node.textContent = poolText(node.dataset.poolStatus));
-  document.querySelectorAll("[data-pool-count]").forEach(node => node.textContent = poolText(node.dataset.poolCount));
+  document.querySelectorAll("[data-pool-count]").forEach(node => node.textContent = node.dataset.poolCount ? poolText(node.dataset.poolCount) : "Pool name pending · No live occupancy available");
   document.querySelectorAll("[data-price-backend]").forEach(node=>node.textContent=activePriceText(state.live?.pricing?.find(row=>row.backend===node.dataset.priceBackend&&row.model===node.dataset.priceModel)));
   const m = state.draft?.models[state.selected];
   const live = state.live?.models.find((row) => row.name === m?.name);
@@ -352,6 +365,7 @@ async function request(path, options = {}) {
   return data;
 }
 function adopt(data) {
+  draftPoolBindings = new Map();
   const accountIndex = Number(state.accountTab?.split(":")[1]);
   const selectedAccountId = state.draft?.backends[accountIndex]?.id;
   const selectedName = state.draft?.models[state.selected]?.name;
@@ -375,7 +389,7 @@ function adopt(data) {
   state.selected = wasAll || !state.draft.models.length ? "all" : matched >= 0 ? matched : Math.min(state.selected, Math.max(0, state.draft.models.length - 1));
   state.dirty = false;
   if (state.selected === 'all' && state.view === 'routing') state.view = 'statistics';
-  if (!state.accounts && state.view !== 'routing') queueMicrotask(() => children());
+  if (state.page === "workspace" && state.view !== 'routing') queueMicrotask(() => children());
 }
 async function refresh() {
   try {
@@ -414,7 +428,7 @@ function resetChildren() {
   state.loading = false;
 }
 async function children() {
-  if (state.accounts || state.view === "routing") return;
+  if (state.page !== "workspace" || state.view === "routing") return;
   const generation = ++state.childGeneration;
   const selected = state.selected,
     view = state.view,
@@ -465,6 +479,8 @@ async function children() {
     render();
   }
 }
+const poolRenameBindings = new WeakMap();
+let draftPoolBindings = new Map();
 app.addEventListener("input", (event) => {
   const n = event.target;
   if (n.id === "preview-at") {
@@ -481,6 +497,18 @@ app.addEventListener("input", (event) => {
           name === old ? n.value : name,
         )),
     );
+  }
+  if (/^capacity_pools\.\d+\.id$/.test(n.dataset.field || "")) {
+    const oldId = get(n.dataset.field);
+    const pool = get(n.dataset.field.split(".").slice(0, -1).join("."));
+    if (!poolRenameBindings.has(n)) {
+      const credentials = state.draft.backends.flatMap(backend => backend.credentials);
+      poolRenameBindings.set(n, oldId
+        ? credentials.filter(credential => credential.pool === oldId)
+        : (draftPoolBindings.get(pool) || []).filter(credential => credentials.includes(credential) && credential.pool === oldId));
+    }
+    draftPoolBindings.set(pool, poolRenameBindings.get(n));
+    poolRenameBindings.get(n).forEach(credential => { credential.pool = n.value; });
   }
   if (n.dataset.field) {
     set(
@@ -506,6 +534,11 @@ app.addEventListener("input", (event) => {
 app.addEventListener("change", (event) => {
   if (!state.editing || state.busy) return;
   const path = event.target.dataset.field;
+  if (path?.endsWith(".pool")) {
+    const credential = get(path.split(".").slice(0, -1).join("."));
+    draftPoolBindings.forEach((bindings, pool) => draftPoolBindings.set(pool, bindings.filter(item => item !== credential)));
+    render();
+  }
   if (path?.endsWith(".backend")) {
     const target = get(path.slice(0, -8));
     target.credential = "";
@@ -567,13 +600,25 @@ app.addEventListener("change", (event) => {
       const tab = app.querySelector(`[data-action="account-tab"][data-path="backend:${index}"]`);
       if (tab) tab.textContent = displayName(backend.id || "New account");
     });
+    app.querySelectorAll("[data-pool-index]").forEach(node => {
+      const pool = state.draft.capacity_pools[Number(node.dataset.poolIndex)];
+      if (pool) {
+        node.dataset.poolCount = pool.id;
+        node.dataset.livePool = pool.id;
+        node.textContent = pool.id ? poolText(pool.id) : "Pool name pending · No live occupancy available";
+      }
+    });
+    app.querySelectorAll("[data-pool-references]").forEach(node => {
+      const pool = state.draft.capacity_pools[Number(node.dataset.poolReferences)];
+      if (pool) node.textContent = `Shared by: ${poolReferences(pool.id).join(", ")}`;
+    });
     const accountHeading = app.querySelector("[data-account-heading]");
-    if (accountHeading) accountHeading.textContent = displayName(state.draft.backends[Number(state.accountTab.split(":")[1])]?.id || "New account");
+    if (accountHeading) accountHeading.textContent = displayName(state.draft.backends[Number(state.accountTab?.split(":")[1])]?.id || "New account");
     state.draft.models.forEach((model, index) => {
       const rail = app.querySelector(`[data-action="select"][data-path="${index}"]`);
       if (rail) rail.textContent = model.name || 'New model';
     });
-    if (!state.accounts && state.view === 'routing') {
+    if (state.page === "workspace" && state.view === 'routing') {
       const heading = app.querySelector('main h1');
       if (heading) heading.textContent = state.draft.models[state.selected]?.name || 'New model';
     }
@@ -585,7 +630,8 @@ function confirmRemoval(path, item) {
     ? (path.startsWith("backends.") ? "upstream model" : "model")
     : ({ layers: "layer", targets: "target", schedules: "time window", backends: "account", credentials: "credential", windows: "price window", capacity_pools: "shared capacity pool" })[collection] || "item";
   const name = item?.name || item?.id || (collection === "targets" ? [displayName(item.backend), item.credential, item.model].filter(Boolean).join(" / ") : "") || "Unnamed";
-  return confirm(`Delete ${type} "${displayName(name)}"? This changes only the draft until Save.`);
+  const impact = collection === "capacity_pools" ? ` This clears pool assignments for: ${poolReferences(item.id).join(", ") || "no credentials"}. Those credentials will have no local concurrency limit.` : "";
+  return confirm(`Delete ${type} "${displayName(name)}"?${impact} This changes only the draft until Save.`);
 }
 app.addEventListener("click", async (event) => {
   const n = event.target.closest("[data-action]");
@@ -634,18 +680,17 @@ app.addEventListener("click", async (event) => {
       return;
     }
     if (a === "account-tab") {
-      if (p !== "pools" && p !== "runtime" && !(/^backend:\d+$/.test(p) && state.draft.backends[Number(p.split(":")[1])])) return;
+      if (!(/^backend:\d+$/.test(p) && state.draft.backends[Number(p.split(":")[1])])) return;
       state.accountTab = p;
       render();
       return;
     }
-    if (a === "accounts" || a === "workspace") {
-      const accountsPage = a === "accounts";
-      if (state.accounts === accountsPage) return;
+    if (["accounts", "workspace", "settings"].includes(a)) {
+      if (state.page === a) return;
       resetChildren();
-      state.accounts = accountsPage;
+      state.page = a;
       render();
-      if (!state.accounts) await children();
+      if (state.page === "workspace") await children();
       return;
     }
     if (a === "select") {
@@ -731,6 +776,12 @@ app.addEventListener("click", async (event) => {
               )),
           );
         }
+        if (/^capacity_pools\.\d+$/.test(p)) {
+          const pool = array[i], id = pool.id;
+          const bound = draftPoolBindings.get(pool) || [];
+          state.draft.backends.forEach(backend => backend.credentials.forEach(credential => { if ((id && credential.pool === id) || bound.includes(credential)) delete credential.pool; }));
+          draftPoolBindings.delete(pool);
+        }
         array.splice(i, 1);
         if (/^backends\.\d+$/.test(p)) {
           const selectedAccount = Number(state.accountTab?.split(":")[1]);
@@ -755,6 +806,19 @@ app.addEventListener("click", async (event) => {
         Math.max(0, state.draft.models.length - 1),
       );
     }
+    if (a === "add-pool") {
+      const credential = get(p);
+      if (!/^backends\.\d+\.credentials\.\d+$/.test(p) || !credential || credential.pool) return;
+      const backend = get(p.split(".").slice(0, 2).join("."));
+      const base = `${backend.id || "account"}-${credential.id || "credential"}`.replace(/[^a-zA-Z0-9_-]/g, "-") || "pool";
+      let id = base, suffix = 2;
+      while (state.draft.capacity_pools.some(pool => pool.id === id)) id = `${base}-${suffix++}`;
+      state.draft.capacity_pools.push({ id, max_in_flight: 1 });
+      credential.pool = id;
+      state.dirty = true;
+      render();
+      return;
+    }
     const defaults = {
       "add-model": {
         name: "",
@@ -775,7 +839,6 @@ app.addEventListener("click", async (event) => {
       },
       "add-credential": { id: "", api_key: "" },
       "add-upstream": { name: "", protocols: ["openai-chat"] },
-      "add-pool": { id: "", max_in_flight: 1 },
       "add-schedule": {
         name: "",
         days: [1, 2, 3, 4, 5, 6, 7],
@@ -791,9 +854,7 @@ app.addEventListener("click", async (event) => {
           ? state.draft.models
           : a === "add-backend"
             ? state.draft.backends
-            : a === "add-pool"
-              ? state.draft.capacity_pools
-              : get(p);
+            : get(p);
       if (!Array.isArray(array)) return;
       array.push(defaults[a]);
       if (a === "add-backend") state.accountTab = `backend:${array.length - 1}`;

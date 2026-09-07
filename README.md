@@ -85,9 +85,10 @@ The API and Routing workspace are available at <http://127.0.0.1:8080>. Compose
 mounts the private `data/routing` directory for validated configuration saves and
 stores the request ledger in a named volume. The initial page is All Statistics
 for 1 day; selecting a model also opens its Statistics for 1 day. Accounts is a
-separate page with one tab per account, plus Shared capacity and Runtime settings.
-It shows read-only information until Enable edit reveals the selected tab's
-editors; all tabs share the workspace draft.
+separate page with one tab per account, including its shared capacity limits and live occupancy.
+Settings is a separate page for global runtime parameters.
+Both pages show read-only information until Enable edit reveals their fields;
+all pages share the workspace draft and confirmed Save transaction.
 Each deletion requires confirmation before changing the draft. Save asks for
 confirmation of all pending updates, validates changed upstream bindings,
 persists readable TOML and immediately activates new requests. Existing requests
@@ -565,7 +566,7 @@ interface.
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /` | All Statistics by default, model-scoped views, and a separate Accounts page. |
+| `GET /` | All Statistics by default, model-scoped views, and separate Accounts and Settings pages. |
 | `GET /healthz` | Health, served models, and uptime. |
 | `GET /api/status` | Configuration summary, target circuits, affinity state, and alerts. |
 | `GET /api/stats?window=1d` | Aggregate request, account, token and recorded cost totals for `1h`, `1d`, `1w`, `1m`, or `all`; omission preserves lifetime totals. |

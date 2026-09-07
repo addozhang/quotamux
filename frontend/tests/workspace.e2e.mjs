@@ -70,11 +70,13 @@ async function enableEditing(page) {
   await expect(action(page, "add-backend")).toHaveCount(0);
   await expect(page.locator('.accounts-page input,.accounts-page select')).toHaveCount(0);
   await expect(action(page, 'account-tab', 'backend:0')).toHaveAttribute('aria-selected','true');
-  for (const tab of ['pools','runtime','backend:0']) {
-    await action(page,'account-tab',tab).click();
-    await expect(action(page,'account-tab',tab)).toHaveAttribute('aria-selected','true');
-    await expect(page.locator('.accounts-page input,.accounts-page select,.accounts-page [data-action="remove"]')).toHaveCount(0);
-  }
+  await expect(action(page,'account-tab','pools')).toHaveCount(0);
+  await expect(action(page,'account-tab','runtime')).toHaveCount(0);
+  await action(page,'settings').click();
+  await expect(page.getByRole('heading',{name:'Settings',exact:true})).toBeVisible();
+  await expect(page.locator('main input,main select,main [data-action]')).toHaveCount(0);
+  await expect(page.locator('main')).toContainText('Upstream connection timeout (ms)');
+  await expect(page.locator('.account-tabs,.model-rail,.child-nav')).toHaveCount(0);
   await action(page, "workspace").click();
   await action(page, "select", "0").click();
   await expect(page.getByRole("heading", {name:"Model statistics", exact:true})).toBeVisible();
@@ -167,7 +169,7 @@ async function auditConfirmations(browser) {
       await action(page, 'select', '0').click();
       await action(page, 'view', 'routing').click();
     } else {
-      await action(page, 'account-tab', path.startsWith('capacity_pools.') ? 'pools' : 'backend:0').click();
+      await action(page, 'account-tab', 'backend:0').click();
     }
     const before = await snapshot();
     let message = '';
@@ -202,20 +204,21 @@ async function inspectReadonlyAccounts(browser) {
   await expect(page.locator('main')).toContainText('UTC');
   await expect(page.locator('main')).not.toContainText(key);
   await page.screenshot({path:artifacts+'/account-readonly-desktop.png',fullPage:true});
-  for(const tab of ['backend:0','pools','runtime']) {
-    await action(page,'account-tab',tab).click();
+  for(const scope of ['accounts','settings']) {
+    await action(page,scope).click();
     await expect(page.locator('main input,main select,main textarea')).toHaveCount(0);
     await page.setViewportSize({width:390,height:844});
-    assert(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth), `${tab} readonly mobile overflow`);
-    await page.screenshot({path:artifacts+`/account-readonly-${tab.replace(':','-')}-mobile.png`,fullPage:true});
+    assert(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth), `${scope} readonly mobile overflow`);
+    await page.screenshot({path:artifacts+`/${scope}-readonly-mobile.png`,fullPage:true});
   }
+  await action(page,'accounts').click();
   await action(page,'account-tab','backend:0').click();
   await action(page,'enable-edit').click();
   await expect(field(page,'backends.0.models.1.pricing_note')).toHaveValue('Subscription quota usage value');
   await action(page,'disable-edit').click();
   await expect(page.locator('main input,main select')).toHaveCount(0);
   await page.close();
-  console.log('PASS account tabs: isolated panels, clear readonly prices/credentials/runtime, mobile, and edit toggle');
+  console.log('PASS account-local capacity and independent Settings: readonly information, mobile, and edit toggle');
 }
 async function physicalClick(page, locator) {
   await locator.evaluate(node => node.scrollIntoView({block:"center", inline:"nearest", behavior:"instant"}));
@@ -225,6 +228,88 @@ async function physicalClick(page, locator) {
   await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
   await page.mouse.down();
   await page.mouse.up();
+}
+async function inspectSettingsAndCapacity(browser) {
+  const page = await browser.newPage();
+  await page.goto(base);
+  await action(page, 'settings').click();
+  await action(page, 'enable-edit').click();
+  const baseline = await (await fetch(base + '/api/routing')).json();
+  const bodyLimit = 'server.max_inference_body_bytes';
+  await expect(field(page, 'backends.0.id')).toHaveCount(0);
+  await expect(field(page, 'server.listen')).toHaveCount(0);
+  await field(page, bodyLimit).fill('256');
+  await action(page, 'accounts').click();
+  await expect(field(page, bodyLimit)).toHaveCount(0);
+  await action(page, 'settings').click();
+  await expect(field(page, bodyLimit)).toHaveValue('256');
+  page.once('dialog', dialog => dialog.dismiss());
+  await action(page, 'save').click();
+  assert.equal((await (await fetch(base+'/api/routing')).json()).revision, baseline.revision);
+  await save(page);
+  await expect(page.getByRole('heading', {name:'Settings',exact:true})).toBeVisible();
+  const largeRequest = () => fetch(base + '/v1/chat/completions', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:'public',messages:[{role:'user',content:'X'.repeat(1024)}]})});
+  const limited = await largeRequest();
+  assert.equal(limited.status,413,'Settings Save applies the request-body limit without restarting');
+  await limited.text();
+  await page.reload();
+  await action(page,'settings').click();
+  await expect(page.locator('main input,main select')).toHaveCount(0);
+  await expect(page.locator('main')).toContainText('256');
+  await action(page,'enable-edit').click();
+  await field(page,bodyLimit).fill(String(baseline.document.server.max_inference_body_bytes));
+  await save(page);
+  const restored = await largeRequest();assert.equal(restored.status,200);await restored.json();
+
+  await action(page,'accounts').click();
+  await action(page,'add-backend').click();
+  await field(page,'backends.1.id').fill('shared-account');
+  await physicalClick(page,action(page,'add-credential','backends.1.credentials'));
+  await field(page,'backends.1.credentials.0.id').fill('shared-key');
+  await field(page,'backends.1.credentials.0.pool').selectOption('shared');
+  await expect(field(page,'capacity_pools.0.max_in_flight')).toHaveValue('2');
+  await field(page,'capacity_pools.0.id').fill('shared-renamed');
+  await physicalClick(page,action(page,'settings'));
+  await expect(page.getByRole('heading',{name:'Settings',exact:true})).toBeVisible();
+  await action(page,'accounts').click();
+  await expect(field(page,'backends.1.credentials.0.pool')).toHaveValue('shared-renamed');
+  await action(page,'account-tab','backend:0').click();
+  await expect(field(page,'backends.0.credentials.0.pool')).toHaveValue('shared-renamed');
+  await expect(field(page,'backends.0.credentials.1.pool')).toHaveValue('shared-renamed');
+  await expect(page.locator('main')).toContainText('shared-account');
+  await field(page,'capacity_pools.0.id').fill('');
+  await physicalClick(page,action(page,'settings'));
+  await action(page,'accounts').click();
+  await expect(field(page,'capacity_pools.0.id')).toHaveValue('');
+  await field(page,'capacity_pools.0.id').fill('shared-renamed');
+  await field(page,'capacity_pools.0.id').blur();
+  await field(page,'backends.0.credentials.1.pool').selectOption('');
+  await field(page,'backends.0.credentials.1.pool').selectOption('shared-renamed');
+  await field(page,'capacity_pools.0.id').fill('shared-again');
+  await field(page,'capacity_pools.0.id').blur();
+  await expect(field(page,'backends.0.credentials.1.pool')).toHaveValue('shared-again');
+  let deletion='';
+  page.once('dialog',async dialog=>{deletion=dialog.message();await dialog.dismiss();});
+  await action(page,'remove','capacity_pools.0').click();
+  assert.match(deletion,/shared-account/);
+  await expect(field(page,'backends.0.credentials.0.pool')).toHaveValue('shared-again');
+  page.once('dialog',dialog=>dialog.accept());
+  await action(page,'remove','capacity_pools.0').click();
+  await expect(field(page,'backends.0.credentials.0.pool')).toHaveValue('');
+  await action(page,'account-tab','backend:1').click();
+  await expect(field(page,'backends.1.credentials.0.pool')).toHaveValue('');
+  page.once('dialog',dialog=>dialog.accept());await action(page,'discard').click();
+  const after = await (await fetch(base+'/api/routing')).json();
+  assert.deepEqual(after.document,baseline.document,'Cross-account capacity edits remain draft-only');
+  await action(page,'accounts').click();
+  page.once('dialog',dialog=>dialog.accept());await action(page,'remove','backends.0').click();
+  await expect(action(page,'account-tab')).toHaveCount(0);
+  await expect(action(page,'add-backend')).toBeVisible();
+  await action(page,'settings').click();
+  await expect(field(page,bodyLimit)).toBeVisible();
+  page.once('dialog',dialog=>dialog.accept());await action(page,'discard').click();
+  await page.close();
+  console.log('PASS Settings confirmed Save has immediate HTTP effect; shared capacity rename/delete preserves all account bindings; empty Accounts remains navigable');
 }
 async function infer(model = "public") {
   const r = await fetch(base + "/v1/chat/completions", {
@@ -316,13 +401,11 @@ try {
   await action(page, "remove", "backends.1").click();
   await expect(action(page, "account-tab", "backend:0")).toHaveAttribute("aria-selected", "true");
   await save(page);
-  await action(page, "account-tab", "pools").click();
-  await action(page, "add-pool").click();
+  await action(page, "add-pool", "backends.0.credentials.0").click();
   await field(page, "capacity_pools.0.id").fill("shared");
   await field(page, "capacity_pools.0.id").blur();
   await field(page, "capacity_pools.0.max_in_flight").fill("2");
-  await action(page, "account-tab", "backend:0").click();
-  await field(page, "backends.0.credentials.0.pool").selectOption("shared");
+  await expect(field(page, "backends.0.credentials.0.pool")).toHaveValue("shared");
   await action(page, "add-credential", "backends.0.credentials").click();
   await field(page, "backends.0.credentials.1.id").fill("second");
   await field(page, "backends.0.credentials.1.id").blur();
@@ -341,7 +424,7 @@ try {
   await field(page,'backends.0.models.1.pricing_schedule.windows.0.name').fill('peak');
   await field(page,'backends.0.models.1.pricing_schedule.windows.0.name').blur();
   await field(page,'backends.0.models.1.pricing_schedule.windows.0.pricing.output_usd_per_million').fill('9');
-  await action(page, "account-tab", "runtime").click();
+  await action(page, "settings").click();
   await expect(
     field(page, "server.timeouts.upstream_connect_ms"),
   ).toBeVisible();
@@ -385,6 +468,9 @@ try {
   );
   await inspectReadonlyAccounts(browser);
   await auditConfirmations(browser);
+  await inspectSettingsAndCapacity(browser);
+  // The independent Settings page has saved and restored the shared document.
+  await action(page,'discard').click();
   const priced=await(await fetch(base+'/api/routing')).json();
   const pricedModel=priced.document.backends[0].models[1];
   assert.equal(pricedModel.pricing_note,'Subscription quota usage value');
@@ -469,7 +555,7 @@ try {
   const poolPage=await browser.newPage();
   await poolPage.goto(base);
   await action(poolPage,'accounts').click();
-  await action(poolPage,'account-tab','pools').click();
+  await action(poolPage,'account-tab','backend:0').click();
   const occupancy=poolPage.locator('[data-live-pool="shared"]');
   await expect(occupancy).toContainText('0 / 2');
   const held = [fetch(base+'/v1/chat/completions', inferenceBody('HOLD')), fetch(base+'/v1/chat/completions', inferenceBody('HOLD'))];
@@ -531,8 +617,17 @@ try {
   await expect(page.locator('.accounts-page')).toBeVisible();
   await expect(page.getByRole('heading', {name:'All statistics', exact:true})).toHaveCount(0);
   await page.unroute('**/api/stats?**');
+  await action(page,'workspace').click();
+  await expect(action(page,'window','1d')).toHaveAttribute('aria-pressed','true');
+  await page.route('**/api/stats?**', async route => {await sleep(500); await route.continue();});
+  await action(page,'window','all').click();
+  await action(page,'settings').click();
+  await sleep(700);
+  await expect(page.getByRole('heading',{name:'Settings',exact:true})).toBeVisible();
+  await expect(page.getByRole('heading',{name:'All statistics',exact:true})).toHaveCount(0);
+  await page.unroute('**/api/stats?**');
   await action(page, 'workspace').click();
-  await expect(action(page, 'window', '1d')).toHaveAttribute('aria-pressed', 'true');
+  await expect(action(page, 'window', 'all')).toHaveAttribute('aria-pressed', 'true');
   await action(page, "view", "history").click();
   await expect(page.locator("tbody")).toContainText("public");
   await expect(page.locator("tbody")).toContainText("second-public");
