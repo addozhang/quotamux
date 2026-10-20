@@ -26,7 +26,13 @@ const MAX_ERROR_BYTES: usize = 16 * 1024;
 pub(super) struct ErrorDetails {
     pub(super) classification_message: String,
     pub(super) safe_message: String,
+    /// Classification discriminator: the upstream `type` when present, otherwise
+    /// its `code`. Adapter classifiers match on this value.
     pub(super) error_type: Option<String>,
+    /// Raw upstream `type` field, retained for diagnosis.
+    pub(super) upstream_type: Option<String>,
+    /// Raw upstream `code` field, retained for diagnosis.
+    pub(super) upstream_code: Option<String>,
 }
 
 #[derive(Clone)]
@@ -51,6 +57,52 @@ pub struct BackendError {
     pub status: Option<StatusCode>,
     pub retry_after: Option<Duration>,
     pub safe_message: String,
+    /// Upstream error `type`, retained in the local ledger and statistics only.
+    pub upstream_type: Option<String>,
+    /// Upstream error `code`, retained in the local ledger and statistics only.
+    pub upstream_code: Option<String>,
+    /// Sanitized and truncated upstream message, retained in the local ledger and
+    /// statistics only. It never replaces the client-facing `safe_message`.
+    pub upstream_message: Option<String>,
+}
+
+impl BackendError {
+    /// Builds an error with no retained upstream envelope detail.
+    pub fn local(
+        class: FailureClass,
+        status: Option<StatusCode>,
+        retry_after: Option<Duration>,
+        safe_message: impl Into<String>,
+    ) -> Self {
+        Self {
+            class,
+            status,
+            retry_after,
+            safe_message: safe_message.into(),
+            upstream_type: None,
+            upstream_code: None,
+            upstream_message: None,
+        }
+    }
+
+    /// Builds an error from a classified upstream error envelope.
+    pub(super) fn from_details(
+        class: FailureClass,
+        status: Option<StatusCode>,
+        retry_after: Option<Duration>,
+        details: &ErrorDetails,
+    ) -> Self {
+        Self {
+            class,
+            status,
+            retry_after,
+            safe_message: details.safe_message.clone(),
+            upstream_type: details.upstream_type.clone(),
+            upstream_code: details.upstream_code.clone(),
+            upstream_message: Some(retained_upstream_message(&details.classification_message))
+                .filter(|message| !message.is_empty()),
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -236,11 +288,13 @@ impl BackendClient {
             .adapter
             .apply_auth(request, &self.api_key, protocol, inbound_headers);
 
-        let response = request.send().await.map_err(|error| BackendError {
-            class: classify_transport(&error),
-            status: error.status(),
-            retry_after: None,
-            safe_message: sanitize_transport_error(&error),
+        let response = request.send().await.map_err(|error| {
+            BackendError::local(
+                classify_transport(&error),
+                error.status(),
+                None,
+                sanitize_transport_error(&error),
+            )
         })?;
         if response.status().is_success() {
             return Ok(response);
@@ -251,12 +305,12 @@ impl BackendClient {
         let body = read_error_body(response).await;
         let details = extract_error_details(&body);
         let class = self.adapter.classify_error(status, &details);
-        Err(BackendError {
+        Err(BackendError::from_details(
             class,
-            status: Some(status),
+            Some(status),
             retry_after,
-            safe_message: details.safe_message,
-        })
+            &details,
+        ))
     }
 
     pub fn request_url(&self, protocol: Protocol) -> String {
@@ -280,13 +334,15 @@ impl BackendClient {
             classification_message: String::new(),
             safe_message: "upstream returned an error envelope".into(),
             error_type: None,
+            upstream_type: None,
+            upstream_code: None,
         });
-        Some(BackendError {
-            class: self.adapter.classify_error(status, &details),
-            status: Some(status),
-            retry_after: None,
-            safe_message: details.safe_message,
-        })
+        Some(BackendError::from_details(
+            self.adapter.classify_error(status, &details),
+            Some(status),
+            None,
+            &details,
+        ))
     }
 }
 
@@ -363,12 +419,16 @@ fn extract_error_details(bytes: &[u8]) -> ErrorDetails {
             classification_message: truncate(text.trim()),
             safe_message: "Cloudflare rejected the HTTP client signature (error 1010)".into(),
             error_type: None,
+            upstream_type: None,
+            upstream_code: None,
         };
     }
     ErrorDetails {
         classification_message: truncate(text.trim()),
         safe_message: "upstream request failed".into(),
         error_type: None,
+        upstream_type: None,
+        upstream_code: None,
     }
 }
 
@@ -381,39 +441,28 @@ fn error_discriminator(value: &Value) -> Option<String> {
 }
 
 fn extract_error_details_from_value(value: &Value) -> Option<ErrorDetails> {
-    let (message, error_type) = if let Some(error) = value.get("error") {
+    let (message, type_field, code_field) = if let Some(error) = value.get("error") {
         if let Some(message) = error.get("message").and_then(Value::as_str) {
-            (
-                message,
-                error
-                    .get("type")
-                    .or_else(|| error.get("code"))
-                    .and_then(error_discriminator),
-            )
+            (message, error.get("type"), error.get("code"))
         } else {
             let message = error.as_str()?;
-            (
-                message,
-                value
-                    .get("type")
-                    .or_else(|| value.get("code"))
-                    .and_then(error_discriminator),
-            )
+            (message, value.get("type"), value.get("code"))
         }
     } else {
         let message = value.get("message").and_then(Value::as_str)?;
-        (
-            message,
-            value
-                .get("type")
-                .or_else(|| value.get("code"))
-                .and_then(error_discriminator),
-        )
+        (message, value.get("type"), value.get("code"))
     };
+    let upstream_type = type_field.and_then(error_discriminator);
+    let upstream_code = code_field.and_then(error_discriminator);
+    // Classification keeps its original discriminator: upstream `type` first, then
+    // `code`. The raw pair is retained separately for diagnosis.
+    let discriminator = upstream_type.clone().or_else(|| upstream_code.clone());
     Some(ErrorDetails {
         classification_message: truncate(message),
         safe_message: "upstream request failed".into(),
-        error_type: error_type.as_deref().map(truncate),
+        error_type: discriminator.as_deref().map(truncate),
+        upstream_type: upstream_type.as_deref().map(truncate),
+        upstream_code: upstream_code.as_deref().map(truncate),
     })
 }
 
@@ -440,6 +489,32 @@ fn truncate(value: &str) -> String {
         .collect()
 }
 
+/// Upstream text retained in the local ledger for diagnosis.
+///
+/// It is the classification text with the same URL removal and truncation plus
+/// credential-shaped tokens removed, because the retained copy is rendered in
+/// the local statistics UI. Classification keeps using the unredacted
+/// `classification_message`, whose phrases drive adapter classifiers.
+fn retained_upstream_message(value: &str) -> String {
+    truncate(value)
+        .split_whitespace()
+        .map(|word| {
+            let lowered = word.to_ascii_lowercase();
+            let secret_shaped = lowered.starts_with("sk-")
+                || lowered.starts_with("bearer")
+                || lowered.starts_with("token=")
+                || lowered.starts_with("api_key")
+                || word.contains('@')
+                || (word.len() >= 24
+                    && word
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+            if secret_shaped { "[redacted]" } else { word }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,6 +531,8 @@ mod tests {
                 classification_message: message.into(),
                 safe_message: message.into(),
                 error_type: error_type.map(str::to_string),
+                upstream_type: error_type.map(str::to_string),
+                upstream_code: None,
             },
         )
     }
@@ -583,6 +660,7 @@ mod tests {
                     "kimi-k2.6",
                     "deepseek-v4-pro",
                     "deepseek-v4-flash",
+                    "deepseek-v4.1-flash",
                     "deepseek-v4-flash-vision-exp",
                     "mimo-v2.5",
                     "mimo-v2.5-pro",
@@ -810,6 +888,62 @@ mod tests {
     }
 
     #[test]
+    fn retains_the_upstream_error_type_code_and_message() {
+        let details = extract_error_details(
+            br#"{"error":{"message":"This model's maximum context length is 1048576 tokens. However, you requested 1103209 tokens (719209 in the messages, 384000 in the completion).","type":"invalid_request_error","param":null,"code":"invalid_request_error"}}"#,
+        );
+        // The classification discriminator keeps its original `type`-then-`code`
+        // semantics so adapter classifiers are unaffected.
+        assert_eq!(details.error_type.as_deref(), Some("invalid_request_error"));
+        assert_eq!(
+            details.upstream_type.as_deref(),
+            Some("invalid_request_error")
+        );
+        assert_eq!(
+            details.upstream_code.as_deref(),
+            Some("invalid_request_error")
+        );
+        assert!(
+            details
+                .classification_message
+                .contains("maximum context length is 1048576 tokens")
+        );
+        let error = BackendError::from_details(
+            FailureClass::ClientRequest,
+            Some(StatusCode::BAD_REQUEST),
+            None,
+            &details,
+        );
+        assert_eq!(
+            error.upstream_message.as_deref().map(str::len),
+            Some(details.classification_message.len())
+        );
+        assert_eq!(error.safe_message, "upstream request failed");
+    }
+
+    #[test]
+    fn retains_a_numeric_upstream_code_separately_from_its_type() {
+        let details = extract_error_details(
+            br#"{"error":{"message":"The max_tokens parameter is illegal.","type":"invalid_request_error","code":1210}}"#,
+        );
+        assert_eq!(details.error_type.as_deref(), Some("invalid_request_error"));
+        assert_eq!(details.upstream_code.as_deref(), Some("1210"));
+    }
+
+    #[test]
+    fn local_errors_carry_no_upstream_detail() {
+        let error = BackendError::local(
+            FailureClass::ProviderTransient,
+            None,
+            None,
+            "upstream request timed out",
+        );
+        assert!(error.upstream_type.is_none());
+        assert!(error.upstream_code.is_none());
+        assert!(error.upstream_message.is_none());
+    }
+
+    #[test]
     fn classifies_opencode_go_usage_limit_from_official_error_shape() {
         let details = extract_error_details(
             br#"{"type":"error","error":{"type":"GoUsageLimitError","message":"Subscription quota exceeded. You can continue using free models."},"metadata":{"limitName":"5 hour"}}"#,
@@ -938,6 +1072,35 @@ mod tests {
         assert!(!details.safe_message.contains("sk-live-secret-value"));
         assert!(!details.safe_message.contains("private-id"));
         assert!(details.classification_message.contains("Incorrect API key"));
+        let error = BackendError::from_details(
+            FailureClass::ProviderAuth,
+            Some(StatusCode::UNAUTHORIZED),
+            None,
+            &details,
+        );
+        let retained = error.upstream_message.expect("retained message");
+        assert!(retained.contains("Incorrect API key"));
+        assert!(!retained.contains("sk-live-secret-value"));
+        assert!(!retained.contains("private-id"));
+        assert!(retained.contains("[redacted]"));
+    }
+
+    #[test]
+    fn retained_upstream_messages_keep_diagnostic_numbers() {
+        let details = extract_error_details(
+            br#"{"error":{"message":"This model's maximum context length is 1048576 tokens. However, you requested 1103209 tokens (719209 in the messages, 384000 in the completion).","type":"invalid_request_error","code":"invalid_request_error"}}"#,
+        );
+        let error = BackendError::from_details(
+            FailureClass::ClientRequest,
+            Some(StatusCode::BAD_REQUEST),
+            None,
+            &details,
+        );
+        let retained = error.upstream_message.expect("retained message");
+        assert!(retained.contains("maximum context length is 1048576 tokens"));
+        assert!(retained.contains("719209"));
+        assert!(retained.contains("384000"));
+        assert!(!retained.contains("[redacted]"));
     }
 
     #[test]

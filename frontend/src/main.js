@@ -28,13 +28,16 @@ const state = {
   history: null,
   totals: null,
   alerts: null,
+  upstreamErrors: null,
   window: "1d",
-  metric: "calls",
   cursor: null,
   cursors: [],
   nextCursor: null,
   childGeneration: 0,
   loading: false,
+  refreshing: false,
+  updatedAt: null,
+  pendingScope: null,
 };
 const browseActions = new Set([
   "enable-edit",
@@ -46,7 +49,7 @@ const browseActions = new Set([
   "select",
   "view",
   "window",
-  "metric",
+  "refresh",
   "older",
   "newer",
   "preview",
@@ -113,6 +116,7 @@ function render() {
     else if (selected.left < bounds.left) tabs.scrollLeft += selected.left - bounds.left;
   }
   updateLive();
+  syncHash(false);
 }
 function modelEditor(m) {
   if (!state.editing) return `<div class="heading"><div><p class="eyebrow">Public model</p><h1>${esc(m.name || "New model")}</h1></div></div><div class="effective" id="effective-order"></div>`;
@@ -218,12 +222,126 @@ const windows = [
   ["1m", "1 month"],
   ["all", "All time"],
 ];
-const metrics = [
-  ["calls", "Calls"],
-  ["total_tokens", "Total tokens"],
-  ["input_tokens", "Input tokens"],
-  ["output_tokens", "Output tokens"],
-];
+const num = (value) => Number(value || 0).toLocaleString();
+// One token shape everywhere: uncached input / output on the main line, cache-hit
+// input and thinking tokens underneath. "—" means the upstream did not report a
+// thinking-token count for that request or aggregate. "≈" marks a locally
+// apportioned estimate used only when the upstream omitted the split while still
+// streaming thinking text (Ollama Cloud never returns completion_tokens_details).
+function tokenDetail(usage) {
+  if (!usage) return '<span class="cell-main">—</span>';
+  const miss = Number(usage.cache_miss_tokens || 0),
+    hit = Number(usage.cache_hit_tokens || 0),
+    out = Number(usage.output_tokens || 0),
+    thinking = Number(usage.reasoning_tokens || 0),
+    estimated = Number(usage.reasoning_estimated_tokens || 0);
+  // Rows recorded before the report flag existed still prove reporting with a
+  // nonzero count; only a zero without the flag stays unknown.
+  const reported = usage.reasoning_reported === true || thinking > 0;
+  const think = reported
+    ? num(thinking)
+    : estimated > 0
+      ? "≈" + num(estimated)
+      : "—";
+  const thinkingText = reported
+    ? num(thinking)
+    : estimated > 0
+      ? `≈${num(estimated)} (estimated from thinking text; upstream omitted the split)`
+      : "not reported";
+  const title = `Uncached input ${num(miss)} · cache-hit input ${num(hit)} · output ${num(out)} · thinking ${thinkingText} · total ${num(usage.total_tokens)}`;
+  return `<span class="cell-main" title="${esc(title)}">${num(miss)} / ${num(out)}</span><span class="cell-sub">cache ↓ ${num(hit)} · think ${think}</span>`;
+}
+// History stays five columns wide: time over date, layer over account/key, so a
+// laptop-width window does not need a horizontal scroll. A failed row adds the
+// retained upstream discriminator under its status.
+function historyRow(r) {
+  const started = new Date(r.started_at_ms);
+  const time = `<span class="cell-main">${esc(started.toLocaleTimeString())}</span><span class="cell-sub">${esc(started.toLocaleDateString())}</span>`;
+  const layer = `<span class="cell-main">${esc(displayName(r.route_layer))}</span><span class="cell-sub">${esc(displayName(r.backend))} / ${esc(r.credential)}</span>`;
+  const detail = upstreamErrorText(r);
+  const status = detail
+    ? `<span class="cell-main">${esc(r.status)}</span><span class="cell-sub" title="${esc(upstreamErrorTitle(r))}">${detail}</span>`
+    : esc(r.status);
+  return `<tr><td title="${esc(started.toLocaleString())}">${time}</td><td>${esc(r.served_model)}</td><td>${layer}</td><td>${status}</td><td class="numeric">${tokenDetail(r.usage)}</td></tr>`;
+}
+function shortText(value, limit = 72) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  return text.length > limit ? text.slice(0, limit - 1) + "…" : text;
+}
+function upstreamErrorText(row) {
+  if (!row?.upstream_error_type && !row?.upstream_error_code && !row?.upstream_error_message)
+    return "";
+  const code = row.upstream_error_code || row.upstream_error_type;
+  return esc(code ? shortText(code, 40) : shortText(row.upstream_error_message, 40));
+}
+function upstreamErrorTitle(row) {
+  return [
+    row.upstream_error_type ? `type: ${row.upstream_error_type}` : "",
+    row.upstream_error_code ? `code: ${row.upstream_error_code}` : "",
+    row.upstream_error_message || "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+// Upstream rejections kept for the selected range: the type/code pair a
+// provider returned plus its sanitized own message. Five columns with two-line
+// cells keep it readable without a horizontal scroll, and rows recorded before
+// retention state their failure class instead of an unexplained dash.
+function upstreamErrorCell(row) {
+  const retained = row.upstream_code || row.upstream_type;
+  const shortClass = row.error_class
+    ? row.error_class.replace(/^provider_/, "")
+    : "";
+  if (retained) {
+    const code = shortText(row.upstream_code || row.upstream_type, 34);
+    const sub =
+      row.upstream_code &&
+      row.upstream_type &&
+      row.upstream_code !== row.upstream_type
+        ? shortText(row.upstream_type, 34)
+        : shortClass;
+    return `<span class="cell-main">${esc(code)}</span>${sub ? `<span class="cell-sub">${esc(sub)}</span>` : ""}`;
+  }
+  if (shortClass) {
+    return `<span class="cell-main">${esc(shortClass)}</span><span class="cell-sub">code not retained</span>`;
+  }
+  return `<span class="cell-main">—</span>`;
+}
+function upstreamErrorsPanel() {
+  const errors = state.upstreamErrors?.errors || [];
+  const rows = errors
+    .map((row) => {
+      const seen = new Date(row.last_seen_ms);
+      const detail = [
+        row.error_class,
+        row.upstream_type,
+        row.upstream_code,
+        row.message,
+      ]
+        .filter(Boolean)
+        .join("\n");
+      return `<tr><td class="numeric">${num(row.count)}</td><td class="upstream-error" title="${esc(detail)}">${upstreamErrorCell(row)}</td><td title="${esc(seen.toLocaleString())}"><span class="cell-main">${row.backend ? esc(displayName(row.backend)) : "—"}</span><span class="cell-sub">${esc(seen.toLocaleDateString())} ${esc(seen.toLocaleTimeString())}</span></td><td class="upstream-message" title="${esc(row.message || "")}">${row.message ? esc(shortText(row.message, 96)) : "—"}</td></tr>`;
+    })
+    .join("");
+  return `<h2>Upstream errors</h2><p class="muted">Failed attempts in this range, grouped by the upstream error type and code. Messages are the upstream's own sanitized text, retained locally for diagnosis. Rows recorded before September 20 keep no upstream code and group by their failure class.</p><div class="table-scroll"><table class="upstream-errors"><thead><tr><th class="numeric">Count</th><th>Upstream error</th><th>Account / last seen</th><th>Message</th></tr></thead><tbody>${rows || '<tr><td colspan="4" class="muted">No upstream errors recorded for this range.</td></tr>'}</tbody></table></div>`;
+}
+function updatedText() {
+  return state.updatedAt
+    ? `Updated ${new Date(state.updatedAt).toLocaleTimeString()}`
+    : "Not updated yet";
+}
+function viewHead(title, controls) {
+  return `<div class="view-head"><h1>${esc(title)}</h1><div class="view-actions"><span class="muted" id="updated-at">${esc(updatedText())}</span>${button("refresh", "Refresh", "", state.refreshing ? "disabled" : "")}</div></div>${controls}`;
+}
+function tokenCells(totals) {
+  const reported = Number(totals?.reasoning_tokens || 0);
+  const estimated = Number(totals?.reasoning_estimated_tokens || 0);
+  const think = reported + estimated;
+  const thinkTitle = estimated
+    ? `${num(reported)} reported · ${num(estimated)} estimated from thinking text`
+    : `${num(reported)} reported`;
+  return `<td class="numeric">${num(totals?.cache_miss_tokens)}</td><td class="numeric">${num(totals?.cache_hit_tokens)}</td><td class="numeric">${num(totals?.output_tokens)}</td><td class="numeric" title="${esc(thinkTitle)}">${num(think)}${estimated ? " ≈" : ""}</td><td class="numeric">${num(totals?.total_tokens)}</td>`;
+}
 function scheduleOrder(path, model) {
   const order = get(path + ".order");
   return `<fieldset><legend>Layer priority for this window</legend>${order
@@ -280,34 +398,32 @@ function childView() {
   if (state.view === "statistics" && state.selected === "all")
     return globalStatistics();
   if (state.view === "history") {
-    return `<h1>Recent request history</h1><div class="buttons">${button("newer", "Newer", "", state.cursors.length ? "" : "disabled")}<span>Page ${state.cursors.length + 1}</span>${button("older", "Older", "", state.nextCursor ? "" : "disabled")}</div><div class="table-scroll"><table><thead><tr><th>Started</th><th>Model</th><th>Layer</th><th>Account / key</th><th>Status</th><th>Tokens</th></tr></thead><tbody>${(state.history?.requests || []).map((r) => `<tr><td>${esc(new Date(r.started_at_ms).toLocaleString())}</td><td>${esc(r.served_model)}</td><td>${esc(displayName(r.route_layer))}</td><td>${esc(displayName(r.backend))} / ${esc(r.credential)}</td><td>${esc(r.status)}</td><td>${esc(r.usage?.total_tokens || 0)}</td></tr>`).join("")}</tbody></table></div>`;
+    const rows = (state.history?.requests || []).map(historyRow).join("");
+    return `${viewHead("Recent request history", `<div class="buttons">${button("newer", "Newer", "", state.cursors.length ? "" : "disabled")}<span>Page ${state.cursors.length + 1}</span>${button("older", "Older", "", state.nextCursor ? "" : "disabled")}</div>`)}<div class="table-scroll"><table><thead><tr><th>Started</th><th>Model</th><th>Layer / account</th><th>Status</th><th class="numeric">Uncached input / output</th></tr></thead><tbody>${rows || '<tr><td colspan="5" class="muted">No requests recorded for this scope.</td></tr>'}</tbody></table></div>`;
   }
-  const value = (totals) =>
-    Number(totals?.[state.metric] || 0).toLocaleString();
   const targetRow = (target, layer, historical = false) =>
-    `<tr><td>${historical ? "Historical target" : "Target"}</td><td>${esc(displayName(layer))}</td><td>${esc(displayName(target.backend))}</td><td>${esc(target.credential)}</td><td>${esc(target.upstream_model || target.model)}</td><td>${value(target.totals)}</td></tr>`;
-  return `<h1>Model statistics</h1><div class="buttons">${windows.map(([id, label]) => button("window", label, id, `aria-pressed="${id === state.window}"`)).join("")}</div><div class="buttons">${metrics.map(([id, label]) => button("metric", label, id, `aria-pressed="${id === state.metric}"`)).join("")}</div><p>Model total: ${value(state.stats?.totals)}</p><div class="table-scroll"><table><thead><tr><th>Entry</th><th>Layer</th><th>Account</th><th>Key</th><th>Upstream model</th><th>${esc(metrics.find(([id]) => id === state.metric)?.[1])}</th></tr></thead><tbody>${(state.stats?.layers || []).map((layer) => `<tr><th>Layer total</th><td>${esc(displayName(layer.name))}</td><td></td><td></td><td></td><td>${value(layer.totals)}</td></tr>${(layer.targets || []).map((target) => targetRow(target, layer.name)).join("")}`).join("")}${(state.stats?.historical_targets || []).map((target) => targetRow(target, target.layer_name || target.layer_index, true)).join("")}${state.stats?.unattributed?.calls ? `<tr><td>No final target</td><td colspan="4">No final layer or target recorded for these requests.</td><td>${value(state.stats.unattributed)}</td></tr>` : ""}</tbody></table></div>`;
+    `<tr><td>${historical ? "Historical target" : "Target"}</td><td>${esc(displayName(layer))}</td><td>${esc(displayName(target.backend))}</td><td>${esc(target.credential)}</td><td>${esc(target.upstream_model || target.model)}</td><td class="numeric">${num(target.totals?.calls)}</td>${tokenCells(target.totals)}</tr>`;
+  const layers = state.stats?.layers || [];
+  const historical = state.stats?.historical_targets || [];
+  const unattributed = state.stats?.unattributed;
+  return `${viewHead("Model statistics", `<div class="buttons">${windows.map(([id, label]) => button("window", label, id, `aria-pressed="${id === state.window}"`)).join("")}</div>`)}<p>Model total: ${num(state.stats?.totals?.total_tokens)} tokens · ${num(state.stats?.totals?.calls)} calls</p><div class="table-scroll"><table><thead><tr><th>Entry</th><th>Layer</th><th>Account</th><th>Key</th><th>Upstream model</th><th class="numeric">Calls</th><th class="numeric">Uncached input</th><th class="numeric">Cached input</th><th class="numeric">Output</th><th class="numeric">Think</th><th class="numeric">Total</th></tr></thead><tbody>${layers.map((layer) => `<tr><th>Layer total</th><td>${esc(displayName(layer.name))}</td><td></td><td></td><td></td><td class="numeric">${num(layer.totals?.calls)}</td>${tokenCells(layer.totals)}</tr>${(layer.targets || []).map((target) => targetRow(target, layer.name)).join("")}`).join("")}${historical.map((target) => targetRow(target, target.layer_name || target.layer_index, true)).join("")}${unattributed?.calls ? `<tr><td>No final target</td><td colspan="4">No final layer or target recorded for these requests.</td><td class="numeric">${num(unattributed.calls)}</td>${tokenCells(unattributed)}</tr>` : ""}${layers.length || historical.length || unattributed?.calls ? "" : '<tr><td colspan="11" class="muted">No requests recorded for this scope.</td></tr>'}</tbody></table></div>${upstreamErrorsPanel()}`;
 }
 function globalStatistics() {
-  return `<h1>All statistics</h1><div class="buttons">${windows.map(([id, label]) => button("window", label, id, `aria-pressed="${id === state.window}"`)).join("")}</div><h2>Account totals</h2><div class="table-scroll"><table><thead><tr><th>Account</th><th>Attempts</th><th>Successes</th><th>Errors</th><th>Cache hit</th><th>Usage value estimate (USD)</th></tr></thead><tbody>${Object.entries(
-    state.totals?.backends || {},
-  )
+  const rows = Object.entries(state.totals?.backends || {})
     .map(([id, row]) => {
       const total =
         Number(row.cache_hit_tokens || 0) + Number(row.cache_miss_tokens || 0);
-      return `<tr><td>${esc(displayName(id))}</td><td>${row.attempts || 0}</td><td>${row.successes || 0}</td><td>${row.errors || 0}</td><td>${row.cache_reported_attempts ? (total ? (100 * row.cache_hit_tokens) / total : 0).toFixed(1) + "%" : "—"}</td><td>${Number(row.cost_usd || 0).toFixed(6)}</td></tr>`;
+      return `<tr><td>${esc(displayName(id))}</td><td class="numeric">${num(row.attempts)}</td><td class="numeric">${num(row.successes)}</td><td class="numeric">${num(row.errors)}</td>${tokenCells(row)}<td class="numeric">${row.cache_reported_attempts ? (total ? (100 * row.cache_hit_tokens) / total : 0).toFixed(1) + "%" : "—"}</td><td class="numeric">${Number(row.cost_usd || 0).toFixed(6)}</td></tr>`;
     })
-    .join(
-      "",
-    )}</tbody></table></div><h2>Active alerts</h2><p class="muted">Current account and credential alerts, independent of the statistics time range.</p><div class="table-scroll"><table><thead><tr><th>Account</th><th>Key</th><th>Class</th><th>Last seen</th><th>Next probe</th></tr></thead><tbody>${(
-    state.alerts?.alerts || []
-  )
+    .join("");
+  const alerts = (state.alerts?.alerts || [])
     .filter((a) => a.active)
     .map(
       (a) =>
         `<tr><td>${esc(displayName(a.backend))}</td><td>${esc(a.credential)}</td><td>${esc(a.class)}</td><td>${esc(new Date(a.last_seen_ms).toLocaleString())}</td><td>${a.next_probe_at_ms ? esc(new Date(a.next_probe_at_ms).toLocaleString()) : "—"}</td></tr>`,
     )
-    .join("")}</tbody></table></div>`;
+    .join("");
+  return `${viewHead("All statistics", `<div class="buttons">${windows.map(([id, label]) => button("window", label, id, `aria-pressed="${id === state.window}"`)).join("")}</div>`)}<p class="muted">Account totals count upstream attempts. Token columns are attempt usage: uncached input / cached input / output / thinking-token totals.</p><h2>Account totals</h2><div class="table-scroll"><table><thead><tr><th>Account</th><th class="numeric">Attempts</th><th class="numeric">Successes</th><th class="numeric">Errors</th><th class="numeric">Uncached input</th><th class="numeric">Cached input</th><th class="numeric">Output</th><th class="numeric">Think</th><th class="numeric">Total</th><th class="numeric">Cache hit</th><th class="numeric">Usage value estimate (USD)</th></tr></thead><tbody>${rows || '<tr><td colspan="11" class="muted">No account attempts recorded for this range.</td></tr>'}</tbody></table></div><h2>Active alerts</h2><p class="muted">Current account and credential alerts, independent of the statistics time range.</p><div class="table-scroll"><table><thead><tr><th>Account</th><th>Key</th><th>Class</th><th>Last seen</th><th>Next probe</th></tr></thead><tbody>${alerts}</tbody></table></div>${upstreamErrorsPanel()}`;
 }
 function updateLive() {
   document.querySelectorAll("[data-pool-status]").forEach(node => node.textContent = poolText(node.dataset.poolStatus));
@@ -387,6 +503,11 @@ function adopt(data) {
   state.revision = data.revision;
   const matched = state.draft.models.findIndex(model => model.name === selectedName);
   state.selected = wasAll || !state.draft.models.length ? "all" : matched >= 0 ? matched : Math.min(state.selected, Math.max(0, state.draft.models.length - 1));
+  if (state.pendingScope) {
+    const pending = state.draft.models.findIndex(model => model.name === state.pendingScope);
+    if (pending >= 0) state.selected = pending;
+    state.pendingScope = null;
+  }
   state.dirty = false;
   if (state.selected === 'all' && state.view === 'routing') state.view = 'statistics';
   if (state.page === "workspace" && state.view !== 'routing') queueMicrotask(() => children());
@@ -424,11 +545,16 @@ function resetChildren() {
   state.stats = null;
   state.totals = null;
   state.alerts = null;
+  state.upstreamErrors = null;
   state.history = null;
   state.loading = false;
+  state.refreshing = false;
 }
-async function children() {
+// A silent child reload keeps the rendered table, pagination and focus intact and
+// only swaps in fresher data. Manual and 20-second automatic refreshes both use it.
+async function children(options = {}) {
   if (state.page !== "workspace" || state.view === "routing") return;
+  const silent = options.silent === true;
   const generation = ++state.childGeneration;
   const selected = state.selected,
     view = state.view,
@@ -442,17 +568,37 @@ async function children() {
     render();
     return;
   }
-  state.loading = true;
-  render();
+  if (!silent) {
+    state.loading = true;
+    render();
+  } else {
+    state.refreshing = true;
+    const updated = document.querySelector("#updated-at");
+    if (updated) updated.textContent = "Refreshing…";
+    const control = document.querySelector('[data-action="refresh"]');
+    if (control) control.disabled = true;
+  }
   try {
     let result;
-    if (view === "statistics")
+    if (view === "statistics") {
+      // Upstream rejections are aggregated on demand for the same window and
+      // scope, so the panel never needs a rollup schema change.
+      const errors = request(
+        `/api/upstream-errors?window=${window}` +
+          (selected === "all"
+            ? ""
+            : "&model=" + encodeURIComponent(model.name)),
+      );
       result =
         selected === "all"
-          ? await Promise.all([request(`/api/stats?window=${window}`), request("/api/status")])
-          : await request(
-              `/api/routing/stats?model=${encodeURIComponent(model.name)}&window=${window}`,
-            );
+          ? await Promise.all([request(`/api/stats?window=${window}`), request("/api/status"), errors])
+          : await Promise.all([
+              request(
+                `/api/routing/stats?model=${encodeURIComponent(model.name)}&window=${window}`,
+              ),
+              errors,
+            ]);
+    }
     if (view === "history")
       result = await request(
         "/api/requests?limit=20" +
@@ -463,9 +609,11 @@ async function children() {
       );
     if (generation !== state.childGeneration) return;
     state.loading = false;
+    state.refreshing = false;
+    state.updatedAt = Date.now();
     if (view === "statistics") {
-      if (selected === "all") [state.totals, state.alerts] = result;
-      else state.stats = result;
+      if (selected === "all") [state.totals, state.alerts, state.upstreamErrors] = result;
+      else [state.stats, state.upstreamErrors] = result;
     }
     if (view === "history") {
       state.history = result;
@@ -475,9 +623,68 @@ async function children() {
   } catch (error) {
     if (generation !== state.childGeneration) return;
     state.loading = false;
+    state.refreshing = false;
     state.message = error.message;
     render();
   }
+}
+// --- Location hash -----------------------------------------------------------
+// #/workspace/<all|model:NAME>/<view>/<window>, #/accounts, #/settings
+// The hash is the single source of truth for reload, back/forward and bookmarks.
+function locationState() {
+  const parts = location.hash
+    .replace(/^#\/?/, "")
+    .split("/")
+    .filter(Boolean)
+    .map(decodeURIComponent);
+  return {
+    page: ["workspace", "accounts", "settings"].includes(parts[0]) ? parts[0] : "workspace",
+    scope: parts[1] || "all",
+    view: ["statistics", "history", "routing"].includes(parts[2]) ? parts[2] : "statistics",
+    window: windows.some(([id]) => id === parts[3]) ? parts[3] : "1d",
+  };
+}
+function hashFor() {
+  if (state.page === "accounts" || state.page === "settings") return `#/${state.page}`;
+  // Only the model name is escaped so the scope stays readable in a bookmark.
+  const scope =
+    state.selected === "all"
+      ? "all"
+      : `model:${encodeURIComponent(state.draft?.models[state.selected]?.name || "")}`;
+  return `#/workspace/${scope}/${state.view}/${state.window}`;
+}
+function syncHash(push = true) {
+  if (!state.draft) return;
+  const next = hashFor();
+  if (location.hash === next) return;
+  if (push) location.hash = next;
+  else history.replaceState(null, "", next);
+}
+function applyLocation() {
+  if (!state.draft) return;
+  const target = locationState();
+  const wanted = target.scope.startsWith("model:") ? target.scope.slice(6) : "all";
+  const current = state.selected === "all" ? "all" : state.draft.models[state.selected]?.name || "";
+  const sameScope = wanted === "all" ? state.selected === "all" : current === wanted;
+  if (
+    state.page === target.page &&
+    state.view === target.view &&
+    state.window === target.window &&
+    sameScope
+  )
+    return;
+  resetChildren();
+  state.page = target.page;
+  if (target.page === "workspace") {
+    const found = state.draft.models.findIndex((model) => model.name === wanted);
+    state.selected = wanted === "all" || found < 0 ? "all" : found;
+    state.view =
+      state.selected === "all" && target.view === "routing" ? "statistics" : target.view;
+    state.window = target.window;
+  }
+  state.message = "";
+  render();
+  if (state.page === "workspace" && state.view !== "routing") children();
 }
 const poolRenameBindings = new WeakMap();
 let draftPoolBindings = new Map();
@@ -662,12 +869,12 @@ app.addEventListener("click", async (event) => {
     }
     if (a === "window") {
       state.window = p;
+      syncHash();
       await children();
       return;
     }
-    if (a === "metric") {
-      state.metric = p;
-      render();
+    if (a === "refresh") {
+      await children({ silent: true, manual: true });
       return;
     }
     if (a === "older") {
@@ -695,6 +902,7 @@ app.addEventListener("click", async (event) => {
       if (state.page === a) return;
       resetChildren();
       state.page = a;
+      syncHash();
       render();
       if (state.page === "workspace") await children();
       return;
@@ -704,8 +912,8 @@ app.addEventListener("click", async (event) => {
       state.selected = p === "all" ? "all" : Number(p);
       state.view = "statistics";
       state.window = "1d";
-      state.metric = "calls";
       state.preview = null;
+      syncHash();
       render();
       if (state.view !== "routing") await children();
       return;
@@ -714,6 +922,7 @@ app.addEventListener("click", async (event) => {
       if (state.selected === "all" && p === "routing") return;
       resetChildren();
       state.view = p;
+      syncHash();
       render();
       if (p !== "routing") await children();
       return;
@@ -905,6 +1114,20 @@ app.addEventListener("click", async (event) => {
     status();
   }
 });
+const initial = locationState();
+state.page = initial.page;
+state.view =
+  initial.scope === "all" && initial.view === "routing" ? "statistics" : initial.view;
+state.window = initial.window;
+state.pendingScope = initial.scope.startsWith("model:") ? initial.scope.slice(6) : null;
+window.addEventListener("hashchange", applyLocation);
 render();
 refresh();
+// Live routing state keeps its short poll so circuit and capacity views stay
+// current; statistics and history data refresh every 20 seconds and on demand.
 setInterval(refresh, 5000);
+setInterval(() => {
+  if (!state.draft || state.page !== "workspace" || state.view === "routing") return;
+  if (state.busy || state.loading || state.refreshing) return;
+  children({ silent: true });
+}, 20000);

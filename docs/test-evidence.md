@@ -1,11 +1,171 @@
 # QuotaMux routing verification evidence
 
-Updated: 2026-09-01 (Asia/Shanghai)
+Updated: 2026-09-18 (Asia/Shanghai)
 
 This report records the data produced by the configuration-v3, layered-routing,
-protocol-translation, configurable inference-body-limit, and memory-only
-prompt-prefix-affinity test runs. API keys, prompt bodies, and model response
-bodies are excluded.
+protocol-translation, configurable inference-body-limit, memory-only
+prompt-prefix-affinity, token-detail, and estimated-thinking test runs. API keys,
+prompt bodies, and model response bodies are excluded.
+
+## September 18, 2026: Estimated thinking tokens for upstreams that omit the split
+
+Ollama Cloud's OpenAI-compatible endpoint streams thinking text but never returns
+`completion_tokens_details`, so `reasoning_tokens` stayed at zero for every
+Ollama-served request and History showed a dash. Three direct probes against
+`https://ollama.com/v1/chat/completions` with `deepseek-v4.1-flash` and
+`reasoning_effort=high` recorded the exact shape:
+
+| Probe | Request | `usage` returned |
+| --- | --- | --- |
+| 1 | non-streaming | `{"prompt_tokens":60,"prompt_tokens_details":{"cached_tokens":0},"completion_tokens":51,"total_tokens":111}` |
+| 2 | streaming + `include_usage` | `{"prompt_tokens":60,"prompt_tokens_details":{"cached_tokens":0},"completion_tokens":157,"total_tokens":217}` |
+| 3 | streaming, long reasoning | `{"prompt_tokens":68,"prompt_tokens_details":{"cached_tokens":0},"completion_tokens":1688,"total_tokens":1756}` |
+
+`completion_tokens_details` was absent in all three, in both streaming and
+non-streaming mode, while `prompt_tokens_details.cached_tokens` was present. The
+thinking text arrived as `message.reasoning` (probe 1, 185 bytes) and
+`delta.reasoning` (probes 2 and 3, 542 and 3,877 bytes) — the key is `reasoning`,
+not `reasoning_content`. Probe 3 proves the thinking tokens are already inside
+`completion_tokens`: 1,688 total against roughly 294 tokens of answer text.
+
+QuotaMux therefore apportions the exact total instead of inventing one:
+
+```
+reasoning_estimated_tokens = round(output_tokens * reasoning_bytes / generated_bytes)
+```
+
+`generated_bytes` covers thinking text, answer text and generated tool-call
+arguments, counted in the streaming loop (both the translated and the native
+path) or from the complete non-streaming body. The estimate is recorded only
+when the upstream omitted the split, thinking text was seen, and the total is
+nonzero; it is capped at `output_tokens` and never replaces a reported count. A
+provider-reported split always wins. Only byte counters are kept — no prompt,
+reasoning, or answer content is stored — and the estimate is never injected into
+the relayed response, so downstream clients still receive exactly the provider's
+usage fields.
+
+Byte share is an approximation: across the three probes the thinking text ran at
+2.78, 3.5 and 3.7 bytes per thinking token, so an apportioned estimate can sit a
+few percent below a provider-reported split while the total stays exact. Because
+thinking is part of `output_tokens`, totals, cache accounting and estimated cost
+are unaffected, and rows recorded before this change keep `reasoning_tokens = 0`
+with no estimate — history is never rewritten.
+
+The store rollup schema moves to version 3, adding estimated reasoning tokens to
+request and attempt rollups next to the reported counter. An older database is
+upgraded at startup by dropping the derived rollup tables and rebuilding them
+from the retained request and attempt ledger, exactly as for version 2.
+
+Live validation ran on an isolated 8081 instance carrying a byte copy of the
+production ledger and a byte-identical copy of the live configuration. Starting
+rebuilt the version-3 rollups from that ledger in 2 seconds to 5,909 calls,
+1,263,278 reported reasoning tokens and zero estimated tokens, so no historical
+row gained an estimate. Three real requests to `deepseek-v4.1-flash` through the
+`ollama-cloud` layer produced:
+
+| Request | Output tokens | Reported | Estimated | Check |
+| --- | --- | --- | --- | --- |
+| streaming, long answer | 87 | 0 | 40 | recomputed from 229 thinking / 264 answer bytes also gives 40 |
+| streaming, one-character answer | 36 | 0 | 36 | answer text was one character, so the split correctly approaches the whole completion |
+| non-streaming | 55 | 0 | 54 | 170 thinking bytes against a numeric answer |
+
+The relayed responses stayed provider-faithful: the client-visible usage keys
+were exactly `prompt_tokens`, `completion_tokens`, `total_tokens` and
+`prompt_tokens_details`, with no `completion_tokens_details`,
+`reasoning_tokens`, or `reasoning_estimated_tokens` injected. A request whose
+upstream streamed no thinking text at all recorded neither a reported nor an
+estimated count and still renders `think —`, which is the correct conservative
+outcome for the intermittent upstream omission.
+
+Browser E2E on that instance passed all seven checks, including a new one that
+selects a model whose upstream omits the split and asserts the history cell
+renders `think ≈N` with an "estimated from thinking text" explanation in its
+title. Automated results for this change: 153 library tests, 60 gateway
+integration tests, 4 config-migration tests, 5 pricing-schedule tests and 17
+routing-workspace integration tests passed, zero failed, seven opt-in
+real-provider tests ignored; `cargo fmt --check` and
+`cargo clippy --all-targets` were clean.
+
+## September 17, 2026: Token detail, manual refresh and 20-second data poll
+
+Statistics and history now show uncached input, cache-hit input, output and
+thinking tokens instead of one total. Statistics uses fixed columns and no
+longer has a metric selector: each layer, routing target and account row gains
+`Calls`, `Uncached input`, `Cached input`, `Output`, `Think` and `Total`. History
+rows show `uncached / output` with `cache ↓ hit · think N` underneath, where a
+dash means the upstream reported no thinking-token detail. A `Refresh` button
+and an `Updated HH:MM:SS` label sit on both pages, statistics and history data
+reload every 20 seconds without disturbing pagination, drafts or focus, and the
+selected page, model, view and time window are encoded in the URL hash so a
+browser reload, bookmark or back navigation returns to the same place. History
+was later narrowed to five columns for laptop widths: the start cell shows the
+time over the date (full timestamp in its title) and the layer cell shows the
+plan over the account/key, both sub-lines in the smaller muted style.
+
+The store rollup schema moves to version 2, adding cache-hit, cache-miss and
+reasoning tokens to request rollups and input, output and reasoning tokens to
+attempt rollups. An older database is upgraded at startup by dropping the
+derived rollup tables and rebuilding them from the retained request and attempt
+ledger; the ledger itself is never rewritten. `Usage` records whether an
+upstream reported a thinking-token count, and rows written before that flag
+existed still show a count whenever the recorded value is nonzero.
+
+Automated results: 144 library tests, 4 config-migration tests, 5 pricing-schedule
+tests and 17 routing-workspace integration tests passed, zero failed, seven
+opt-in real-provider tests ignored. Browser E2E on isolated 8081 passed with new
+coverage for the refresh control, account token columns, per-request token
+detail including a real thinking-token response, reload and back navigation, and
+the 20-second poll under a fast-forwarded clock.
+
+An identical production-ledger snapshot was served by the previous image and the
+candidate image to prove the upgrade: all-time request totals, errors,
+fallbacks, bytes, output tokens and every per-account attempts, successes,
+errors, cache-hit, cache-miss and cost field matched exactly. The only observed
+difference was a one-ULP floating-point representation change in one account's
+accumulated cost estimate (`1.2028436644` versus `1.2028436643999998`), caused by
+rebuilding the sum in a different order. Every model's aggregated calls,
+uncached, cached, thinking, output and total tokens also matched an independent
+page-by-page summation of the retained request ledger.
+
+On the live isolated 8081 instance carrying a copy of production data, the
+browser check confirmed the account totals matched the API, `glm-5.3-flash`
+model statistics exposed nonzero thinking tokens, history rows rendered the
+per-request cache and thinking detail, manual refresh kept the scope, the hash
+deep link survived reload and back navigation, and the automatic poll fired
+after 19 s. The full headerless smoke matrix passed against real Ollama Cloud
+routing (Chat, reasoning and usage, tools, Chat stream, Responses and stream,
+Anthropic and stream, local count tokens, persistent statistics).
+
+## September 11, 2026: Go session compatibility fix
+
+QuotaMux now supplies Go's required session header for ordinary callers.
+Nonempty explicit Go sessions take priority, followed by native Claude,
+`session_id`, and `x-session-id`. Without a caller session, one UUID is generated
+per logical request and retained across fallback attempts. Separate unidentified
+requests remain separate. Only Go forwards the normalized header; configured
+upstream authentication remains authoritative. The smoke suite no longer adds
+its own session header, so the ordinary headerless client path is exercised.
+225 automated tests and browser E2E passed. Full headerless Go smoke passed
+on both isolated 8081 and production 8080; all four caller session variants
+passed live checks. Configuration and historical data were preserved.
+
+## September 11, 2026: DeepSeek V4.1 Flash
+
+The production-source branch adds the V4.1 Flash Go catalog entry and forwards
+explicit `x-opencode-session` headers to Go while preserving configured bearer
+authentication. 222 automated tests passed, zero failed, seven opt-in real tests
+were ignored. Formatting, Clippy and browser E2E passed. Five isolated calendar
+previews verified weekday start/end boundaries and weekend default pricing.
+
+All three V4.1 upstreams passed the full smoke matrix on isolated 8081: Chat,
+reasoning/usage, tools, streams, Responses, Anthropic, local count tokens and
+persistent statistics. An initial Go call exposed HTTP 400 `MissingSessionID`;
+forwarding the caller's stable header resolved it. An initial trivial official
+response omitted reasoning; the subsequent complete suite passed unchanged.
+The final production smoke passed through Ollama, preserving prior history,
+shared capacity and `restart: unless-stopped`. V4 Pro remains configured.
+Release details and private rollback artifacts are under the main checkout's
+`data/releases/20260911-deepseek-v41/` (ignored).
 
 ## Automated results
 

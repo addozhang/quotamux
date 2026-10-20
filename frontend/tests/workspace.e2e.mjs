@@ -8,7 +8,8 @@ const root = resolve(import.meta.dirname, "../..");
 const artifacts = resolve(root, "data/e2e");
 await mkdir(artifacts, { recursive: true });
 const dir = await mkdtemp(artifacts + "/workspace-");
-const base = "http://127.0.0.1:8081",
+const port = Number(process.env.QUOTAMUX_E2E_PORT || 8081);
+const base = `http://127.0.0.1:${port}`,
   key = "workspace-fake-key";
 let child,
   browser,
@@ -27,6 +28,46 @@ const mock = createServer(async (req, res) => {
   }
   const data = JSON.parse(body);
   if (data.messages?.[0]?.content === "HOLD") await new Promise(resolve => heldRequests.push(resolve));
+  if (data.messages?.[0]?.content === "ERROR400") {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify({
+        error: {
+          message:
+            "mock upstream rejected the request: maximum context length is 1048576 tokens (719209 in the messages, 384000 in the completion)",
+          type: "invalid_request_error",
+          code: "invalid_request_error",
+        },
+      }),
+    );
+    return;
+  }
+  if (data.messages?.[0]?.content === "THINK") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify({
+        id: "test",
+        object: "chat.completion",
+        model: data.model,
+        choices: [
+          {
+            index: 0,
+            message: { role: "assistant", content: "OK" },
+            finish_reason: "stop",
+          },
+        ],
+        usage: {
+          prompt_tokens: 30,
+          completion_tokens: 5,
+          total_tokens: 35,
+          prompt_cache_hit_tokens: 20,
+          prompt_cache_miss_tokens: 10,
+          completion_tokens_details: { reasoning_tokens: 2 },
+        },
+      }),
+    );
+    return;
+  }
   if (data.stream) {
     res.writeHead(200, { "Content-Type": "text/event-stream" });
     res.end(
@@ -400,13 +441,13 @@ try {
   const guard = createServer();
   await new Promise((r, j) => {
     guard.on("error", j);
-    guard.listen(8081, "127.0.0.1", r);
+    guard.listen(port, "127.0.0.1", r);
   });
   await new Promise((r) => guard.close(r));
   await new Promise((r) => mock.listen(0, "127.0.0.1", r));
   await writeFile(
     dir + "/config.toml",
-    `config_version=3\n[server]\nlisten="127.0.0.1:8081"\ndata_dir="${dir}/data"\n[[backends]]\nid="mock"\nadapter="custom-chat-completions"\nendpoint="http://${mockHost}:${mock.address().port}/chat"\n[[backends.credentials]]\nid="primary"\napi_key="${key}"\n[[backends.models]]\nname="upstream"\nprotocols=["openai-chat"]\n[[models]]\nname="public"\nprotocols=["openai-chat"]\n[[models.layers]]\nname="first"\nstrategy="random"\ntargets=[{backend="mock",credential="primary",model="upstream"}]\n`,
+    `config_version=3\n[server]\nlisten="127.0.0.1:${port}"\ndata_dir="${dir}/data"\n[[backends]]\nid="mock"\nadapter="custom-chat-completions"\nendpoint="http://${mockHost}:${mock.address().port}/chat"\n[[backends.credentials]]\nid="primary"\napi_key="${key}"\n[[backends.models]]\nname="upstream"\nprotocols=["openai-chat"]\n[[models]]\nname="public"\nprotocols=["openai-chat"]\n[[models.layers]]\nname="first"\nstrategy="random"\ntargets=[{backend="mock",credential="primary",model="upstream"}]\n`,
     { mode: 0o600 },
   );
   child = spawn(
@@ -659,9 +700,8 @@ try {
   await action(page, 'window', 'all').click();
   const noTarget = page.locator('tbody tr').filter({hasText:'No final target'});
   await expect(noTarget).toHaveCount(1);
-  await expect(noTarget.locator('td').last()).toHaveText('1');
-  await action(page, 'metric', 'output_tokens').click();
-  await expect(noTarget.locator('td').last()).toHaveText('0');
+  await expect(noTarget.locator('td').nth(2)).toHaveText('1');
+  await expect(noTarget.locator('td').nth(7)).toHaveText('0');
   console.log('PASS actual full-capacity rejection remains attributed to its model, with No final target shown only when needed');
   await action(page, "select", "0").click();
   await action(page, "view", "statistics").click();
@@ -669,7 +709,6 @@ try {
     page.getByRole("heading", { name: "Model statistics", exact: true }),
   ).toBeVisible();
   await action(page, "window", "all").click();
-  await action(page, "metric", "output_tokens").click();
   await expect(
     page.getByRole("heading", { name: "Account totals" }),
   ).toHaveCount(0);
@@ -777,6 +816,203 @@ try {
   await page.screenshot({path: artifacts + '/accounts-mobile.png', fullPage:true});
   await page.setViewportSize({width:1280, height:900});
   await page.screenshot({path: artifacts + '/accounts-desktop.png', fullPage:true});
+
+  // Refresh control, token detail, hash deep links and the 20-second data poll.
+  await action(page, "workspace").click();
+  await action(page, "select", "all").click();
+  await expect(page.getByRole("heading", {name:"All statistics", exact:true})).toBeVisible();
+  await expect(page.locator("#updated-at")).toContainText("Updated");
+  const manualRefresh = page.waitForResponse((r) => new URL(r.url()).pathname === "/api/stats");
+  await action(page, "refresh").click();
+  assert.equal((await manualRefresh).status(), 200);
+  await expect(page.getByRole("heading", {name:"All statistics", exact:true})).toBeVisible();
+  await expect(action(page, "window", "1d")).toHaveAttribute("aria-pressed", "true");
+  console.log("PASS manual refresh reloads the visible statistics scope without leaving it");
+
+  const accountTotals = await (await fetch(base + "/api/stats?window=1d")).json();
+  const accountRow = page.locator("tbody tr").filter({has: page.locator("td:first-child", {hasText:/^mock$/})}).first();
+  for (const [column, field] of [[4,"cache_miss_tokens"],[5,"cache_hit_tokens"],[6,"output_tokens"],[7,"reasoning_tokens"],[8,"total_tokens"]])
+    await expect(accountRow.locator("td").nth(column)).toHaveText(String(accountTotals.backends.mock[field]));
+  console.log("PASS account totals carry uncached input, cached input, output, thinking and total tokens");
+
+  const liveModels = (await (await fetch(base + "/api/routing")).json()).models;
+  const onlyModel = liveModels[0].name;
+  await action(page, "select", "0").click();
+  await action(page, "window", "all").click();
+  await action(page, "view", "history").click();
+  const thinkResponse = await fetch(base + "/v1/chat/completions", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({model: onlyModel, messages: [{role: "user", content: "THINK"}]}),
+  });
+  assert.equal(thinkResponse.status, 200);
+  await thinkResponse.json();
+  const historyRefresh = page.waitForResponse((r) => new URL(r.url()).pathname === "/api/requests");
+  await action(page, "refresh").click();
+  await historyRefresh;
+  const historyApi = await (await fetch(base + "/api/requests?limit=20&model=" + encodeURIComponent(onlyModel))).json();
+  const newest = historyApi.requests[0].usage;
+  assert.equal(newest.reasoning_reported, true);
+  assert.equal(newest.reasoning_tokens, 2);
+  const tokenCell = page.locator("tbody tr").first().locator("td").nth(4);
+  const numbers = (text) => text.split("/").map((part) => Number(part.replace(/[^0-9]/g, "")));
+  await expect
+    .poll(() => tokenCell.locator(".cell-main").textContent().then(numbers))
+    .toEqual([newest.cache_miss_tokens, newest.output_tokens]);
+  await expect
+    .poll(() => tokenCell.locator(".cell-sub").textContent())
+    .toContain(`cache ↓ ${newest.cache_hit_tokens.toLocaleString()}`);
+  await expect
+    .poll(() => tokenCell.locator(".cell-sub").textContent())
+    .toContain(`think ${newest.reasoning_tokens.toLocaleString()}`);
+  console.log("PASS history rows show uncached input / output with cache-hit input and thinking tokens");
+
+  await action(page, "view", "statistics").click();
+  await action(page, "window", "1w").click();
+  const deepLink = page.url();
+  assert(deepLink.includes("#/workspace/model:"), `deep link: ${deepLink}`);
+  assert(deepLink.endsWith("/statistics/1w"), `deep link: ${deepLink}`);
+  await page.reload();
+  await expect(page.getByRole("heading", {name:"Model statistics", exact:true})).toBeVisible();
+  await expect(action(page, "window", "1w")).toHaveAttribute("aria-pressed", "true");
+  await expect(action(page, "select", "0")).toHaveAttribute("aria-current", "page");
+  await action(page, "view", "history").click();
+  await expect(page.getByText("Page 1", {exact:true})).toBeVisible();
+  await page.goBack();
+  await expect(page.getByRole("heading", {name:"Model statistics", exact:true})).toBeVisible();
+  await expect(action(page, "window", "1w")).toHaveAttribute("aria-pressed", "true");
+  console.log("PASS reload, bookmark URL and back navigation keep the model, view and window");
+
+  const clockPage = await browser.newPage({viewport:{width:1280,height:900}});
+  const statsRequests = [];
+  clockPage.on("request", (r) => { if (new URL(r.url()).pathname === "/api/stats") statsRequests.push(r.url()); });
+  await clockPage.clock.install();
+  await clockPage.goto(base);
+  await expect(clockPage.getByRole("heading", {name:"All statistics", exact:true})).toBeVisible();
+  const beforeAuto = statsRequests.length;
+  await clockPage.clock.fastForward(20000);
+  await expect.poll(() => statsRequests.length, {timeout:10000}).toBeGreaterThan(beforeAuto);
+  await expect(clockPage.getByRole("heading", {name:"All statistics", exact:true})).toBeVisible();
+  await clockPage.screenshot({path: artifacts + "/statistics-token-detail.png", fullPage:true});
+  await clockPage.close();
+  console.log("PASS statistics data refreshes itself every 20 seconds");
+
+  // Upstream rejection retention: the passed-through body, the true streaming
+  // flag, the sanitized upstream message and both statistics surfaces.
+  const rejection = await fetch(base + "/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: onlyModel,
+      stream: true,
+      messages: [{ role: "user", content: "ERROR400" }],
+    }),
+  });
+  assert.equal(
+    rejection.status,
+    400,
+    "an upstream request-semantic rejection is passed through",
+  );
+  const rejectionBody = await rejection.json();
+  assert.equal(rejectionBody.error.type, "client_request");
+  assert.equal(rejectionBody.error.upstream_type, "invalid_request_error");
+  assert.equal(rejectionBody.error.upstream_code, "invalid_request_error");
+  assert(
+    !rejectionBody.error.message.includes("maximum context length"),
+    "the upstream prose stays out of the client-facing message",
+  );
+  console.log(
+    "PASS passed-through 400 keeps its generic message and adds the upstream type/code",
+  );
+
+  const failed = (await (await fetch(base + "/api/requests?limit=5")).json()).requests.find(
+    (record) => record.status === 400,
+  );
+  assert(failed, "the rejected request is recorded");
+  assert.equal(
+    failed.streaming,
+    true,
+    "a streaming failure before commitment records streaming: true",
+  );
+  assert.equal(failed.error_class, "client_request");
+  assert.equal(failed.upstream_error_type, "invalid_request_error");
+  assert.equal(failed.upstream_error_code, "invalid_request_error");
+  assert(
+    failed.upstream_error_message.includes("maximum context length"),
+    "the sanitized upstream message is retained on the request record",
+  );
+  console.log(
+    "PASS a pre-commit streaming rejection records its real streaming flag and upstream detail",
+  );
+
+  // Finite windows end at the last completed minute, matching the statistics
+  // totals, so a rejection from the current minute is asserted without a bound.
+  const bucket = (await (await fetch(base + "/api/upstream-errors?window=all")).json())
+    .errors[0];
+  assert.equal(bucket.upstream_code, "invalid_request_error");
+  assert(bucket.count >= 1, "the rejection is counted");
+  assert(bucket.message.includes("maximum context length"));
+  const scoped = (
+    await (
+      await fetch(
+        base +
+          "/api/upstream-errors?window=all&model=" +
+          encodeURIComponent(onlyModel),
+      )
+    ).json()
+  ).errors;
+  assert(
+    scoped.length >= 1 && scoped[0].upstream_code === "invalid_request_error",
+    "model scope filters the same retained detail",
+  );
+  await action(page, "select", "all").click();
+  await action(page, "view", "statistics").click();
+  await action(page, "window", "all").click();
+  await expect(
+    page.getByRole("heading", { name: "Upstream errors", exact: true }),
+  ).toBeVisible();
+  const errorRow = page
+    .locator("tbody tr")
+    .filter({ hasText: "invalid_request_error" })
+    .first();
+  await expect(errorRow).toContainText("invalid_request_error");
+  await expect(errorRow.locator("td.upstream-message")).toHaveAttribute(
+    "title",
+    /maximum context length/,
+  );
+  const panel = page.locator("table.upstream-errors").first();
+  assert(
+    await panel.evaluate((table) => {
+      const box = table.closest(".table-scroll");
+      return table.scrollWidth <= box.clientWidth + 1;
+    }),
+    "the upstream error panel fits its container without a horizontal scroll",
+  );
+  assert(
+    await panel
+      .locator("td.upstream-error")
+      .first()
+      .evaluate((cell) => cell.scrollWidth <= cell.clientWidth + 1),
+    "a long discriminator is clamped instead of widening the table",
+  );
+  await page.screenshot({
+    path: artifacts + "/statistics-upstream-errors.png",
+    fullPage: true,
+  });
+  console.log(
+    "PASS statistics group upstream rejections by retained type and code",
+  );
+
+  await action(page, "view", "history").click();
+  const failedRow = page.locator("tbody tr").first();
+  await expect(failedRow).toContainText("400");
+  await expect(failedRow.locator("td").nth(3).locator(".cell-sub")).toContainText(
+    "invalid_request_error",
+  );
+  console.log(
+    "PASS history rows expose the retained upstream detail on failed requests",
+  );
+
   assert.deepEqual(errors, []);
   console.log(
     "PASS invalid-key persistence protection, stale writer, model CRUD, stats/history, mobile and console",

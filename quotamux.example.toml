@@ -43,6 +43,54 @@ id = "go-plan"
 api_key = ""
 
 [[backends.models]]
+name = "deepseek-v4.1-flash"
+protocols = []
+pricing_note = "OpenCode Go: listed $10/month subscription. USD rates value quota usage, not an additional cash invoice. DeepSeek weekday peak 01:00-04:00 and 06:00-10:00 UTC; GLM-5.3-Flash uses its static published rate. V4.1 Flash rates verified 2026-09-11."
+pricing_source = "https://opencode.ai/docs/go/"
+
+[backends.models.pricing]
+cache_hit_input_usd_per_million = 0.003
+cache_miss_input_usd_per_million = 0.15
+output_usd_per_million = 0.6
+
+[backends.models.pricing_schedule]
+timezone = "UTC"
+
+[[backends.models.pricing_schedule.windows]]
+name = "Weekday morning peak"
+days = [
+    1,
+    2,
+    3,
+    4,
+    5,
+]
+start = "01:00"
+end = "04:00"
+
+[backends.models.pricing_schedule.windows.pricing]
+cache_hit_input_usd_per_million = 0.006
+cache_miss_input_usd_per_million = 0.3
+output_usd_per_million = 1.2
+
+[[backends.models.pricing_schedule.windows]]
+name = "Weekday afternoon peak"
+days = [
+    1,
+    2,
+    3,
+    4,
+    5,
+]
+start = "06:00"
+end = "10:00"
+
+[backends.models.pricing_schedule.windows.pricing]
+cache_hit_input_usd_per_million = 0.006
+cache_miss_input_usd_per_million = 0.3
+output_usd_per_million = 1.2
+
+[[backends.models]]
 name = "deepseek-v4-flash"
 # The OpenCode Go adapter owns this official model's endpoint family.
 # Published default and weekday peak usage rates, checked 2026-09-07.
@@ -142,6 +190,58 @@ adapter = "deepseek-official"
 [[backends.credentials]]
 id = "deepseek-payg"
 api_key = ""
+
+[[backends.models]]
+name = "deepseek-flash"
+protocols = [
+    "openai-chat",
+    "openai-responses",
+    "anthropic-messages",
+]
+pricing_note = "DeepSeek official USD pay-as-you-go usage estimate. Weekday peak 01:00-04:00 and 06:00-10:00 UTC. Published USD prices are used directly, without an inferred exchange rate. V4.1 Flash rates verified 2026-09-11."
+pricing_source = "https://api-docs.deepseek.com/quick_start/pricing/"
+
+[backends.models.pricing]
+cache_hit_input_usd_per_million = 0.003
+cache_miss_input_usd_per_million = 0.15
+output_usd_per_million = 0.6
+
+[backends.models.pricing_schedule]
+timezone = "UTC"
+
+[[backends.models.pricing_schedule.windows]]
+name = "Weekday morning peak"
+days = [
+    1,
+    2,
+    3,
+    4,
+    5,
+]
+start = "01:00"
+end = "04:00"
+
+[backends.models.pricing_schedule.windows.pricing]
+cache_hit_input_usd_per_million = 0.006
+cache_miss_input_usd_per_million = 0.3
+output_usd_per_million = 1.2
+
+[[backends.models.pricing_schedule.windows]]
+name = "Weekday afternoon peak"
+days = [
+    1,
+    2,
+    3,
+    4,
+    5,
+]
+start = "06:00"
+end = "10:00"
+
+[backends.models.pricing_schedule.windows.pricing]
+cache_hit_input_usd_per_million = 0.006
+cache_miss_input_usd_per_million = 0.3
+output_usd_per_million = 1.2
 
 [[backends.models]]
 name = "deepseek-v4-flash"
@@ -294,3 +394,18 @@ strategy = "random"
 targets = [
   { backend = "kimi-code", credential = "kimi-code-allegretto", model = "k3" },
 ]
+
+# V4.1 Flash has a distinct Go ID and uses deepseek-flash on the official API.
+[[models]]
+name = "deepseek-v4.1-flash"
+protocols = ["openai-chat", "openai-responses", "anthropic-messages"]
+
+[[models.layers]]
+name = "plan"
+strategy = "random"
+targets = [{ backend = "opencode-go", credential = "go-plan", model = "deepseek-v4.1-flash" }]
+
+[[models.layers]]
+name = "payg"
+strategy = "random"
+targets = [{ backend = "deepseek", credential = "deepseek-payg", model = "deepseek-flash" }]

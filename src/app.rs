@@ -36,7 +36,10 @@ use crate::{
     routing::RandomSelector,
     sse::{SseDecoder, SseEvent},
     store::{AttemptRollup, RequestRollup, RouteRollupKey, Store},
-    types::{AlertRecord, AttemptRecord, FailureClass, Protocol, RequestRecord, Usage},
+    types::{
+        AlertRecord, AttemptRecord, FailureClass, GeneratedTextBytes, Protocol, RequestRecord,
+        Usage,
+    },
 };
 
 const METADATA_HEADER: &str = "x-relay-include-metadata";
@@ -409,6 +412,7 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .route("/routing/stats", get(routing_stats))
         .route("/requests", get(requests))
         .route("/attempts", get(attempts))
+        .route("/upstream-errors", get(upstream_errors))
         .fallback(api_not_found);
     Router::new()
         .route("/healthz", get(health))
@@ -520,7 +524,11 @@ fn inference_body_too_large(state: &AppState, protocol: Protocol, headers: &Head
     let limit_bytes = u64::try_from(limit).unwrap_or(u64::MAX);
     let request_bytes = content_length.unwrap_or_else(|| limit_bytes.saturating_add(1));
     let message = format!("request body exceeds configured limit of {limit} bytes");
-    let body = error_body(protocol, &message, FailureClass::ClientRequest);
+    let body = error_body(
+        protocol,
+        &BackendError::local(FailureClass::ClientRequest, None, None, message),
+        FailureClass::ClientRequest,
+    );
     let response_bytes = serde_json::to_vec(&body)
         .map(|bytes| bytes.len() as u64)
         .unwrap_or(0);
@@ -553,6 +561,9 @@ fn inference_body_too_large(state: &AppState, protocol: Protocol, headers: &Head
         claude_session_id: header_text(headers, "x-claude-code-session-id"),
         claude_agent_id: header_text(headers, "x-claude-code-agent-id"),
         claude_parent_agent_id: header_text(headers, "x-claude-code-parent-agent-id"),
+        upstream_error_type: None,
+        upstream_error_code: None,
+        upstream_error_message: None,
     };
     persist_request(state, &record);
     tracing::warn!(
@@ -575,12 +586,34 @@ fn inference_body_too_large(state: &AppState, protocol: Protocol, headers: &Head
 async fn handle_inference(
     state: Arc<AppState>,
     protocol: Protocol,
-    headers: HeaderMap,
+    mut headers: HeaderMap,
     body: Value,
 ) -> Response {
     if let Err(error) = resolve_served_model(&state, protocol, &body) {
         return validation_error(protocol, error);
     }
+    // Normalize once for the entire logical request, including fallback attempts.
+    // Only the Go adapter forwards this header to its upstream.
+    let session = [
+        "x-opencode-session",
+        "x-claude-code-session-id",
+        "session_id",
+        "x-session-id",
+    ]
+    .into_iter()
+    .find_map(|name| {
+        headers
+            .get(name)
+            .filter(|value| value.to_str().is_ok_and(|text| !text.trim().is_empty()))
+    })
+    .cloned()
+    .unwrap_or_else(|| {
+        Uuid::now_v7()
+            .to_string()
+            .parse()
+            .expect("UUID is a valid session header")
+    });
+    headers.insert("x-opencode-session", session);
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     if streaming {
         handle_stream(state, protocol, headers, body).await
@@ -809,12 +842,12 @@ fn terminal_route_failure(
     candidate: Option<RouteCandidate>,
 ) -> (AttemptFailure, Option<RouteCandidate>) {
     let failure = failure.unwrap_or_else(|| AttemptFailure {
-        error: BackendError {
-            class: FailureClass::FallbackUnavailable,
-            status: Some(StatusCode::SERVICE_UNAVAILABLE),
-            retry_after: None,
-            safe_message: "no route target is currently available".into(),
-        },
+        error: BackendError::local(
+            FailureClass::FallbackUnavailable,
+            Some(StatusCode::SERVICE_UNAVAILABLE),
+            None,
+            "no route target is currently available".to_string(),
+        ),
     });
     (failure, candidate)
 }
@@ -885,6 +918,7 @@ async fn handle_nonstream(
                     &headers,
                     &body,
                     &request_id,
+                    &served_model.name,
                     sequence,
                     started,
                 )
@@ -918,6 +952,7 @@ async fn handle_nonstream(
                             &request_id,
                             &candidate,
                             failure.error.class,
+                            &failure.error,
                         )
                         .await;
                         fallback_reason.get_or_insert(failure.error.class);
@@ -958,6 +993,7 @@ async fn handle_nonstream(
             started_at_ms,
             started,
             request_bytes,
+            false,
             failure,
             candidate.as_ref(),
             include_metadata,
@@ -979,7 +1015,7 @@ async fn handle_nonstream(
     };
 
     let response_bytes = serde_json::to_vec(&outcome.body).unwrap_or_default();
-    let usage = usage_for(outcome.egress, &outcome.raw_upstream);
+    let usage = completed_usage(outcome.egress, &outcome.raw_upstream);
     let record = RequestRecord {
         id: request_id.clone(),
         started_at_ms,
@@ -1011,6 +1047,9 @@ async fn handle_nonstream(
         claude_session_id: header_text(&headers, "x-claude-code-session-id"),
         claude_agent_id: header_text(&headers, "x-claude-code-agent-id"),
         claude_parent_agent_id: header_text(&headers, "x-claude-code-parent-agent-id"),
+        upstream_error_type: None,
+        upstream_error_code: None,
+        upstream_error_message: None,
     };
     persist_request(&state, &record);
     let mut response = (StatusCode::OK, Json(outcome.body)).into_response();
@@ -1052,6 +1091,7 @@ async fn execute_json_attempt(
     headers: &HeaderMap,
     original: &Value,
     request_id: &str,
+    served_model: &str,
     sequence: u32,
     request_started: Instant,
 ) -> Result<JsonSuccess, AttemptFailure> {
@@ -1064,12 +1104,12 @@ async fn execute_json_attempt(
             Ok(value) => value,
             Err(error) => {
                 return Err(AttemptFailure {
-                    error: BackendError {
-                        class: FailureClass::ClientRequest,
-                        status: Some(error.status),
-                        retry_after: None,
-                        safe_message: error.message,
-                    },
+                    error: BackendError::local(
+                        FailureClass::ClientRequest,
+                        Some(error.status),
+                        None,
+                        error.message,
+                    ),
                 });
             }
         };
@@ -1086,6 +1126,7 @@ async fn execute_json_attempt(
                 candidate,
                 runtime.client.adapter_kind(),
                 runtime.client.model(),
+                served_model,
                 egress,
                 translated,
                 candidate.probe,
@@ -1103,12 +1144,12 @@ async fn execute_json_attempt(
     let bytes = match response.bytes().await {
         Ok(bytes) => bytes,
         Err(_) => {
-            let error = BackendError {
-                class: FailureClass::ProviderTransient,
-                status: Some(status),
-                retry_after: None,
-                safe_message: "upstream response body failed".into(),
-            };
+            let error = BackendError::local(
+                FailureClass::ProviderTransient,
+                Some(status),
+                None,
+                "upstream response body failed".to_string(),
+            );
             let record = failed_attempt(
                 &attempt_id,
                 Some(request_id),
@@ -1116,6 +1157,7 @@ async fn execute_json_attempt(
                 candidate,
                 runtime.client.adapter_kind(),
                 runtime.client.model(),
+                served_model,
                 egress,
                 translated,
                 candidate.probe,
@@ -1131,12 +1173,12 @@ async fn execute_json_attempt(
     let raw: Value = match serde_json::from_slice(&bytes) {
         Ok(value) => value,
         Err(_) => {
-            let error = BackendError {
-                class: FailureClass::ProviderUnknown5xxOrTransport,
-                status: Some(status),
-                retry_after: None,
-                safe_message: "upstream returned malformed JSON".into(),
-            };
+            let error = BackendError::local(
+                FailureClass::ProviderUnknown5xxOrTransport,
+                Some(status),
+                None,
+                "upstream returned malformed JSON".to_string(),
+            );
             let record = failed_attempt(
                 &attempt_id,
                 Some(request_id),
@@ -1144,6 +1186,7 @@ async fn execute_json_attempt(
                 candidate,
                 runtime.client.adapter_kind(),
                 runtime.client.model(),
+                served_model,
                 egress,
                 translated,
                 candidate.probe,
@@ -1164,6 +1207,7 @@ async fn execute_json_attempt(
             candidate,
             runtime.client.adapter_kind(),
             runtime.client.model(),
+            served_model,
             egress,
             translated,
             candidate.probe,
@@ -1186,7 +1230,7 @@ async fn execute_json_attempt(
     } else {
         raw.clone()
     };
-    let usage = usage_for(egress, &raw);
+    let usage = completed_usage(egress, &raw);
     let rates = runtime.client.pricing_at(
         chrono::DateTime::from_timestamp_millis(started_at_ms).expect("valid attempt timestamp"),
     );
@@ -1203,6 +1247,7 @@ async fn execute_json_attempt(
         selection_reason: Some(candidate.selection_reason.clone()),
         matched_prefix_bytes: candidate.matched_prefix_bytes,
         upstream_model: runtime.client.model().into(),
+        served_model: Some(served_model.into()),
         egress_protocol: egress,
         translated,
         probe: candidate.probe,
@@ -1219,6 +1264,9 @@ async fn execute_json_attempt(
         usage,
         provider_cost_usd: cost,
         sanitized_error: None,
+        upstream_error_type: None,
+        upstream_error_code: None,
+        upstream_error_message: None,
     };
     persist_attempt(state, &record);
     Ok(JsonSuccess {
@@ -1303,6 +1351,7 @@ async fn handle_stream(
                     &headers,
                     &body,
                     &request_id,
+                    &served_model.name,
                     sequence,
                     started,
                 )
@@ -1332,6 +1381,7 @@ async fn handle_stream(
                             &request_id,
                             &candidate,
                             failure.error.class,
+                            &failure.error,
                         )
                         .await;
                         fallback_reason.get_or_insert(failure.error.class);
@@ -1372,6 +1422,7 @@ async fn handle_stream(
             started_at_ms,
             started,
             request_bytes,
+            true,
             failure,
             candidate.as_ref(),
             include_metadata,
@@ -1433,6 +1484,7 @@ async fn handle_stream(
         let _capacity = capacity;
         let mut response_bytes = 0_u64;
         let mut usage = Usage::default();
+        let mut generated = GeneratedTextBytes::default();
         let mut stream_error = None;
         let mut stream_error_message = None;
         let mut response_translator =
@@ -1497,6 +1549,7 @@ async fn handle_stream(
                                 };
                                 for chunk in chat_chunks {
                                     if chunk.get("usage").is_some_and(|value| !value.is_null()) { usage = Usage::from_openai(&chunk); }
+                                    generated.observe_chat_chunk(&chunk);
                                     let events = match protocol {
                                         Protocol::OpenAiResponses => response_translator.translate(&chunk),
                                         Protocol::AnthropicMessages => anthropic_translator.translate(&chunk),
@@ -1531,6 +1584,7 @@ async fn handle_stream(
                         };
                         let semantic_error=stream_error_class(&provider_client, upstream_status, &event, Some(&parsed));
                         observe_stream_usage(protocol, &mut usage, &parsed);
+                        generated.observe_stream_event(protocol, &parsed);
                         let event_type=event.event.as_deref().or_else(||parsed.get("type")?.as_str());
                         let bytes=event.encode(); response_bytes+=bytes.len() as u64; yield Ok::<Bytes, Infallible>(bytes);
                         if let Some(class)=semantic_error {
@@ -1555,6 +1609,7 @@ async fn handle_stream(
             }
         }
         let completed_at_ms=Utc::now().timestamp_millis();
+        usage.estimate_reasoning(generated);
         let attempt = AttemptRecord {
             id:attempt_id,
             request_id:Some(request_id_for_stream.clone()),
@@ -1567,6 +1622,7 @@ async fn handle_stream(
             selection_reason:Some(candidate_for_stream.selection_reason.clone()),
             matched_prefix_bytes:candidate_for_stream.matched_prefix_bytes,
             upstream_model:upstream_model.clone(),
+            served_model:Some(configured_model.clone()),
             egress_protocol:egress,
             translated,
             probe,
@@ -1582,7 +1638,10 @@ async fn handle_stream(
             total_ms:started.elapsed().as_millis() as u64,
             usage:usage.clone(),
             provider_cost_usd:provider_cost(upstream_pricing.as_ref(),&usage),
-            sanitized_error:stream_error_message
+            sanitized_error:stream_error_message.clone(),
+            upstream_error_type:None,
+            upstream_error_code:None,
+            upstream_error_message:None,
         };
         persist_attempt(&state_for_stream,&attempt);
         let request = RequestRecord {
@@ -1613,12 +1672,21 @@ async fn handle_stream(
             usage:usage.clone(),
             claude_session_id,
             claude_agent_id,
-            claude_parent_agent_id
+            claude_parent_agent_id,
+            upstream_error_type:None,
+            upstream_error_code:None,
+            upstream_error_message:None
         };
         persist_request(&state_for_stream,&request);
         if let Some(class)=stream_error {
             permit.failure(class,None).await;
-            record_alert_if_needed(&state_for_stream,&request_id_for_stream,&candidate_for_stream,class).await;
+            record_alert_if_needed(
+                &state_for_stream,
+                &request_id_for_stream,
+                &candidate_for_stream,
+                class,
+                &BackendError::local(class, Some(upstream_status), None, stream_error_message.clone().unwrap_or_else(|| "upstream stream failed".into())),
+            ).await;
         } else {
             observe_affinity(&state_for_stream,&candidate_for_stream,&usage);
             permit.success().await;
@@ -1703,6 +1771,7 @@ async fn prepare_stream_attempt(
     headers: &HeaderMap,
     original: &Value,
     request_id: &str,
+    served_model: &str,
     sequence: u32,
     request_started: Instant,
 ) -> Result<PreparedStream, AttemptFailure> {
@@ -1715,12 +1784,12 @@ async fn prepare_stream_attempt(
             Ok(value) => value,
             Err(error) => {
                 return Err(AttemptFailure {
-                    error: BackendError {
-                        class: FailureClass::ClientRequest,
-                        status: Some(error.status),
-                        retry_after: None,
-                        safe_message: error.message,
-                    },
+                    error: BackendError::local(
+                        FailureClass::ClientRequest,
+                        Some(error.status),
+                        None,
+                        error.message,
+                    ),
                 });
             }
         };
@@ -1737,6 +1806,7 @@ async fn prepare_stream_attempt(
                 candidate,
                 runtime.client.adapter_kind(),
                 runtime.client.model(),
+                served_model,
                 egress,
                 translated,
                 candidate.probe,
@@ -1754,12 +1824,12 @@ async fn prepare_stream_attempt(
     let event = match decoder.next_event().await {
         Ok(Some(event)) => event,
         Ok(None) => {
-            let error = BackendError {
-                class: FailureClass::StreamFailure,
-                status: Some(status),
-                retry_after: None,
-                safe_message: "upstream SSE ended before its first semantic event".into(),
-            };
+            let error = BackendError::local(
+                FailureClass::StreamFailure,
+                Some(status),
+                None,
+                "upstream SSE ended before its first semantic event".to_string(),
+            );
             let record = failed_attempt(
                 &attempt_id,
                 Some(request_id),
@@ -1767,6 +1837,7 @@ async fn prepare_stream_attempt(
                 candidate,
                 runtime.client.adapter_kind(),
                 runtime.client.model(),
+                served_model,
                 egress,
                 translated,
                 candidate.probe,
@@ -1779,12 +1850,12 @@ async fn prepare_stream_attempt(
             return Err(AttemptFailure { error });
         }
         Err(decode_error) => {
-            let error = BackendError {
-                class: FailureClass::StreamFailure,
-                status: Some(status),
-                retry_after: None,
-                safe_message: decode_error.safe_message().into(),
-            };
+            let error = BackendError::local(
+                FailureClass::StreamFailure,
+                Some(status),
+                None,
+                decode_error.safe_message().to_string(),
+            );
             let record = failed_attempt(
                 &attempt_id,
                 Some(request_id),
@@ -1792,6 +1863,7 @@ async fn prepare_stream_attempt(
                 candidate,
                 runtime.client.adapter_kind(),
                 runtime.client.model(),
+                served_model,
                 egress,
                 translated,
                 candidate.probe,
@@ -1811,12 +1883,12 @@ async fn prepare_stream_attempt(
         let error = parsed_first_event
             .as_ref()
             .and_then(|value| runtime.client.classify_semantic_error(status, value))
-            .unwrap_or(BackendError {
+            .unwrap_or(BackendError::local(
                 class,
-                status: Some(status),
-                retry_after: None,
-                safe_message: "upstream returned an SSE error before commit".into(),
-            });
+                Some(status),
+                None,
+                "upstream returned an SSE error before commit",
+            ));
         let record = failed_attempt(
             &attempt_id,
             Some(request_id),
@@ -1824,6 +1896,7 @@ async fn prepare_stream_attempt(
             candidate,
             runtime.client.adapter_kind(),
             runtime.client.model(),
+            served_model,
             egress,
             translated,
             candidate.probe,
@@ -1836,12 +1909,12 @@ async fn prepare_stream_attempt(
         return Err(AttemptFailure { error });
     }
     if event.data != "[DONE]" && parsed_first_event.is_none() {
-        let error = BackendError {
-            class: FailureClass::StreamFailure,
-            status: Some(status),
-            retry_after: None,
-            safe_message: "upstream sent malformed SSE before commit".into(),
-        };
+        let error = BackendError::local(
+            FailureClass::StreamFailure,
+            Some(status),
+            None,
+            "upstream sent malformed SSE before commit".to_string(),
+        );
         let record = failed_attempt(
             &attempt_id,
             Some(request_id),
@@ -1849,6 +1922,7 @@ async fn prepare_stream_attempt(
             candidate,
             runtime.client.adapter_kind(),
             runtime.client.model(),
+            served_model,
             egress,
             translated,
             candidate.probe,
@@ -1972,6 +2046,7 @@ async fn terminal_failure(
     started_at_ms: i64,
     started: Instant,
     request_bytes: u64,
+    streaming: bool,
     failure: AttemptFailure,
     candidate: Option<&RouteCandidate>,
     include_metadata: bool,
@@ -1992,7 +2067,7 @@ async fn terminal_failure(
         requested_model: requested_model.into(),
         served_model: Some(served_model.into()),
         upstream_model: candidate.map(|candidate| candidate.target.model.clone()),
-        streaming: false,
+        streaming,
         status: status.as_u16(),
         error_class: Some(class),
         backend: candidate.map(|candidate| candidate.target.backend.clone()),
@@ -2017,12 +2092,15 @@ async fn terminal_failure(
         claude_session_id: None,
         claude_agent_id: None,
         claude_parent_agent_id: None,
+        upstream_error_type: failure.error.upstream_type.clone(),
+        upstream_error_code: failure.error.upstream_code.clone(),
+        upstream_error_message: failure.error.upstream_message.clone(),
     };
     persist_request(state, &record);
     if let Some(candidate) = candidate {
-        record_alert_if_needed(state, request_id, candidate, class).await;
+        record_alert_if_needed(state, request_id, candidate, class, &failure.error).await;
     }
-    let body = error_body(protocol, &failure.error.safe_message, class);
+    let body = error_body(protocol, &failure.error, class);
     let mut response = (status, Json(body)).into_response();
     if let Some(candidate) = candidate {
         let egress = target_runtime(state, &candidate.target)
@@ -2043,12 +2121,26 @@ async fn terminal_failure(
     response
 }
 
-fn error_body(protocol: Protocol, message: &str, class: FailureClass) -> Value {
+fn error_body(protocol: Protocol, error: &BackendError, class: FailureClass) -> Value {
+    // The client-facing message stays generic; the upstream discriminator is
+    // attached as extra detail so clients can react without parsing prose.
+    let upstream_type = error
+        .upstream_type
+        .clone()
+        .map(Value::String)
+        .unwrap_or(Value::Null);
+    let upstream_code = error
+        .upstream_code
+        .clone()
+        .map(Value::String)
+        .unwrap_or(Value::Null);
     match protocol {
         Protocol::AnthropicMessages => {
-            json!({"type":"error","error":{"type":"api_error","message":message},"request_id":Uuid::now_v7().to_string()})
+            json!({"type":"error","error":{"type":"api_error","message":error.safe_message.clone(),"upstream_type":upstream_type,"upstream_code":upstream_code},"request_id":Uuid::now_v7().to_string()})
         }
-        _ => json!({"error":{"message":message,"type":class.as_str(),"code":class.as_str()}}),
+        _ => {
+            json!({"error":{"message":error.safe_message.clone(),"type":class.as_str(),"code":class.as_str(),"upstream_type":upstream_type,"upstream_code":upstream_code}})
+        }
     }
 }
 
@@ -2081,6 +2173,7 @@ fn failed_attempt(
     candidate: &RouteCandidate,
     adapter_kind: AdapterKind,
     model: &str,
+    served_model: &str,
     egress: Protocol,
     translated: bool,
     probe: bool,
@@ -2101,6 +2194,7 @@ fn failed_attempt(
         selection_reason: Some(candidate.selection_reason.clone()),
         matched_prefix_bytes: candidate.matched_prefix_bytes,
         upstream_model: model.into(),
+        served_model: Some(served_model.into()),
         egress_protocol: egress,
         translated,
         probe,
@@ -2119,6 +2213,9 @@ fn failed_attempt(
         usage: Usage::default(),
         provider_cost_usd: None,
         sanitized_error: Some(error.safe_message.clone()),
+        upstream_error_type: error.upstream_type.clone(),
+        upstream_error_code: error.upstream_code.clone(),
+        upstream_error_message: error.upstream_message.clone(),
     }
 }
 
@@ -2128,6 +2225,14 @@ fn usage_for(protocol: Protocol, value: &Value) -> Usage {
         Protocol::OpenAiResponses => Usage::from_responses(value),
         Protocol::AnthropicMessages => Usage::from_anthropic(value),
     }
+}
+
+/// Usage from a complete non-streaming upstream body, with the local reasoning
+/// estimate filled in when the provider omitted `completion_tokens_details`.
+fn completed_usage(protocol: Protocol, value: &Value) -> Usage {
+    let mut usage = usage_for(protocol, value);
+    usage.estimate_reasoning(GeneratedTextBytes::observe_response(protocol, value));
+    usage
 }
 
 fn observe_stream_usage(protocol: Protocol, current: &mut Usage, value: &Value) {
@@ -2172,6 +2277,7 @@ async fn record_alert_if_needed(
     request_id: &str,
     candidate: &RouteCandidate,
     class: FailureClass,
+    error: &BackendError,
 ) {
     if !matches!(
         class,
@@ -2204,6 +2310,9 @@ async fn record_alert_if_needed(
         last_seen_ms: now,
         next_probe_at_ms: snapshot.next_probe_at_ms,
         request_id: Some(request_id.into()),
+        upstream_error_type: error.upstream_type.clone(),
+        upstream_error_code: error.upstream_code.clone(),
+        upstream_error_message: error.upstream_message.clone(),
     };
     if let Err(error) = state.store.record_alert(&record) {
         tracing::error!(%error,"failed to persist alert")
@@ -2349,6 +2458,58 @@ async fn attempts(State(state): State<Arc<AppState>>, Query(query): Query<LimitQ
     }
 }
 
+#[derive(Deserialize)]
+struct UpstreamErrorsQuery {
+    window: Option<String>,
+    model: Option<String>,
+}
+
+/// Aggregated upstream rejections for the selected statistics window. The
+/// retained type/code pair is what makes a passed-through `400` explainable
+/// without rebuilding the client's request.
+async fn upstream_errors(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<UpstreamErrorsQuery>,
+) -> Response {
+    let (window_id, from_ms, to_ms) = match routing_window(
+        query.window.as_deref().unwrap_or("all"),
+        Utc::now().timestamp_millis(),
+    ) {
+        Ok(window) => window,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response();
+        }
+    };
+    let model = match query.model.as_deref() {
+        Some(name) => match state.config.resolve_model(name) {
+            Some(model) => Some(model.name.clone()),
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error":"unknown served model","code":"unknown_model"})),
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
+    match state
+        .store
+        .upstream_errors(from_ms, to_ms, model.as_deref(), 12)
+    {
+        Ok(errors) => Json(json!({
+            "errors": errors,
+            "window": {"id": window_id, "from_ms": from_ms, "to_ms": to_ms},
+        }))
+        .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":error,"code":"statistics_query_failed"})),
+        )
+            .into_response(),
+    }
+}
+
 async fn routing(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({"models":state.routing_rows(Utc::now()).await}))
 }
@@ -2479,6 +2640,10 @@ fn request_metric_json(value: RequestRollup) -> Value {
     json!({
         "calls": value.calls,
         "input_tokens": value.input_tokens,
+        "cache_hit_tokens": value.cache_hit_tokens,
+        "cache_miss_tokens": value.cache_miss_tokens,
+        "reasoning_tokens": value.reasoning_tokens,
+        "reasoning_estimated_tokens": value.reasoning_estimated_tokens,
         "output_tokens": value.output_tokens,
         "total_tokens": value.total_tokens,
     })
@@ -2663,8 +2828,14 @@ fn attempt_rollup_json(value: AttemptRollup) -> Value {
         "successes":value.successes,
         "errors":value.errors,
         "cache_reported_attempts":value.cache_reported_attempts,
+        "input_tokens":value.input_tokens,
         "cache_hit_tokens":value.cache_hit_tokens,
         "cache_miss_tokens":value.cache_miss_tokens,
+        "reasoning_tokens":value.reasoning_tokens,
+        "reasoning_estimated_tokens":value.reasoning_estimated_tokens,
+        "output_tokens":value.output_tokens,
+        // Attempt rollups keep the components; every parser defines the total as input + output.
+        "total_tokens":value.input_tokens.saturating_add(value.output_tokens),
         "cost_usd":value.cost_usd,
     })
 }
@@ -2672,6 +2843,58 @@ fn attempt_rollup_json(value: AttemptRollup) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_error_bodies_carry_the_upstream_discriminator() {
+        let details = crate::provider::ErrorDetails {
+            classification_message: "maximum context length is 1048576 tokens".into(),
+            safe_message: "upstream request failed".into(),
+            error_type: Some("invalid_request_error".into()),
+            upstream_type: Some("invalid_request_error".into()),
+            upstream_code: Some("invalid_request_error".into()),
+        };
+        let error = BackendError::from_details(
+            FailureClass::ClientRequest,
+            Some(StatusCode::BAD_REQUEST),
+            None,
+            &details,
+        );
+        let chat = error_body(Protocol::OpenAiChat, &error, FailureClass::ClientRequest);
+        assert_eq!(chat["error"]["message"], "upstream request failed");
+        assert_eq!(chat["error"]["type"], "client_request");
+        assert_eq!(chat["error"]["code"], "client_request");
+        assert_eq!(chat["error"]["upstream_type"], "invalid_request_error");
+        assert_eq!(chat["error"]["upstream_code"], "invalid_request_error");
+        assert!(
+            !chat["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("maximum context length"),
+            "the upstream prose stays out of the client message"
+        );
+
+        let anthropic = error_body(
+            Protocol::AnthropicMessages,
+            &error,
+            FailureClass::ClientRequest,
+        );
+        assert_eq!(anthropic["type"], "error");
+        assert_eq!(anthropic["error"]["type"], "api_error");
+        assert_eq!(anthropic["error"]["upstream_code"], "invalid_request_error");
+    }
+
+    #[test]
+    fn client_error_bodies_omit_upstream_detail_for_local_failures() {
+        let error = BackendError::local(
+            FailureClass::LocalCapacity,
+            Some(StatusCode::SERVICE_UNAVAILABLE),
+            None,
+            "no route target is currently available",
+        );
+        let body = error_body(Protocol::OpenAiChat, &error, FailureClass::LocalCapacity);
+        assert!(body["error"]["upstream_type"].is_null());
+        assert!(body["error"]["upstream_code"].is_null());
+    }
 
     #[test]
     fn affinity_canonicalization_ignores_transport_and_model_fields() {

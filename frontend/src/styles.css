@@ -394,6 +394,16 @@ th {
 tbody tr:last-child > * { border-bottom: 0; }
 tbody tr:hover > * { background: #19202a; }
 .table-scroll { border: 1px solid var(--line); background: var(--panel); }
+/* Upstream error panel: the discriminator and message columns clamp instead of
+   widening the table, so a laptop window needs no horizontal scroll. Full text
+   stays in each cell's title. */
+.upstream-errors { width: 100%; }
+.upstream-errors .upstream-error { max-width: 26ch; overflow: hidden; text-overflow: ellipsis; }
+.upstream-errors .upstream-message {
+  max-width: min(56ch, 22vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .buttons [aria-pressed="true"] { background: #25302e; color: var(--accent); }
 .child-nav { gap: 18px; border-bottom: 1px solid var(--line); }
 .child-nav button {
@@ -423,3 +433,23 @@ tbody tr:hover > * { background: #19202a; }
 .info-grid dd { margin: 4px 0 0; overflow-wrap: anywhere; }
 .accounts-page h2, .accounts-page h3, .accounts-page p { overflow-wrap: anywhere; }
 .accounts-page .table-scroll { margin-top: 12px; }
+
+/* Statistics and history header: title on the left, refresh control on the right. */
+.view-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.view-head h1 { margin-bottom: 14px; }
+.view-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.view-actions .muted { font-size: 12px; }
+th.numeric,
+td.numeric { text-align: right; font-variant-numeric: tabular-nums; }
+.cell-main { display: block; color: var(--text); }
+.cell-sub { display: block; color: var(--muted); font-size: 12px; }

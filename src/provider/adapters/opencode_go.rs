@@ -46,6 +46,7 @@ impl ProviderAdapter for OpenCodeGo {
             | "kimi-k2.6"
             | "deepseek-v4-pro"
             | "deepseek-v4-flash"
+            | "deepseek-v4.1-flash"
             | "deepseek-v4-flash-vision-exp"
             | "mimo-v2.5"
             | "mimo-v2.5-pro"
@@ -65,9 +66,13 @@ impl ProviderAdapter for OpenCodeGo {
         request: RequestBuilder,
         api_key: &str,
         _protocol: Protocol,
-        _inbound_headers: &HeaderMap,
+        inbound_headers: &HeaderMap,
     ) -> RequestBuilder {
-        bearer_auth(request, api_key)
+        let request = bearer_auth(request, api_key);
+        match inbound_headers.get("x-opencode-session") {
+            Some(session) => request.header("x-opencode-session", session.clone()),
+            None => request,
+        }
     }
 
     fn classify_error(&self, status: StatusCode, details: &ErrorDetails) -> FailureClass {
@@ -92,5 +97,37 @@ impl ProviderAdapter for OpenCodeGo {
             return FailureClass::ProviderConfiguration;
         }
         super::super::classify_status(status, message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forwards_only_supplied_session_header_and_uses_configured_bearer_key() {
+        for session in [None, Some("session-test-123")] {
+            let mut inbound_headers = HeaderMap::new();
+            inbound_headers.insert("authorization", "Bearer inbound-key".parse().unwrap());
+            inbound_headers.insert("x-unrelated", "private-value".parse().unwrap());
+            if let Some(session) = session {
+                inbound_headers.insert("x-opencode-session", session.parse().unwrap());
+            }
+            let request = OPENCODE_GO
+                .apply_auth(
+                    reqwest::Client::new().post("https://opencode.ai/zen/go/v1/chat/completions"),
+                    "configured-key",
+                    Protocol::OpenAiChat,
+                    &inbound_headers,
+                )
+                .build()
+                .unwrap();
+            assert_eq!(request.headers()["authorization"], "Bearer configured-key");
+            assert_eq!(
+                request.headers().get("x-opencode-session"),
+                inbound_headers.get("x-opencode-session")
+            );
+            assert!(!request.headers().contains_key("x-unrelated"));
+        }
     }
 }

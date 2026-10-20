@@ -7,17 +7,20 @@ use std::{
 };
 
 use chrono::Utc;
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
+use redb::{
+    Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle,
+    WriteTransaction,
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
-use crate::types::{AlertRecord, AttemptRecord, RequestRecord};
+use crate::types::{AlertRecord, AttemptRecord, RequestRecord, UpstreamErrorBucket};
 
 const STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("state");
 const REQUESTS: TableDefinition<&str, &[u8]> = TableDefinition::new("requests");
 const ATTEMPTS: TableDefinition<&str, &[u8]> = TableDefinition::new("attempts");
 const ALERTS: TableDefinition<&str, &[u8]> = TableDefinition::new("alerts");
-type RequestRollupValue = (u64, u64, u64, u64, u64, u64, u64);
+type RequestRollupValue = (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64);
 type RequestBucketKey<'a> = (
     &'a str,
     u8,
@@ -30,7 +33,7 @@ type RequestBucketKey<'a> = (
     &'a str,
 );
 type RequestAllKey<'a> = (&'a str, u8, u32, &'a str, &'a str, &'a str, &'a str);
-type AttemptRollupValue = (u64, u64, u64, u64, u64, u64, f64);
+type AttemptRollupValue = (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, f64);
 
 const REQUEST_ROLLUP_BUCKET: TableDefinition<RequestBucketKey<'static>, RequestRollupValue> =
     TableDefinition::new("request_rollup_bucket_v1");
@@ -52,7 +55,11 @@ struct AttemptBucketMeta {
 const STATS_META: TableDefinition<&str, &[u8]> = TableDefinition::new("stats_meta_v1");
 
 const STATS_META_KEY: &str = "rollup";
-const STATS_SCHEMA_VERSION: u32 = 1;
+/// Version 2 adds cache-hit, cache-miss and reasoning token detail to both rollups.
+/// Version 3 adds locally estimated reasoning tokens for upstreams that omit the
+/// reasoning split while still streaming thinking text.
+/// Upgrading rebuilds every rollup table from the retained request/attempt ledger.
+const STATS_SCHEMA_VERSION: u32 = 3;
 const MIGRATION_BATCH_SIZE: usize = 1_000;
 const MINUTE_MS: i64 = 60_000;
 const HOUR_MS: i64 = 3_600_000;
@@ -70,6 +77,10 @@ pub struct RequestRollup {
     pub errors: u64,
     pub fallbacks: u64,
     pub input_tokens: u64,
+    pub cache_hit_tokens: u64,
+    pub cache_miss_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub reasoning_estimated_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
     pub bytes: u64,
@@ -81,8 +92,12 @@ pub struct AttemptRollup {
     pub successes: u64,
     pub errors: u64,
     pub cache_reported_attempts: u64,
+    pub input_tokens: u64,
     pub cache_hit_tokens: u64,
     pub cache_miss_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub reasoning_estimated_tokens: u64,
+    pub output_tokens: u64,
     pub cost_usd: f64,
 }
 
@@ -174,18 +189,10 @@ impl Store {
         transaction
             .open_table(ALERTS)
             .map_err(|error| error.to_string())?;
-        transaction
-            .open_table(REQUEST_ROLLUP_BUCKET)
-            .map_err(|error| error.to_string())?;
-        transaction
-            .open_table(REQUEST_ROLLUP_ALL)
-            .map_err(|error| error.to_string())?;
-        transaction
-            .open_table(ATTEMPT_ROLLUP_ALL)
-            .map_err(|error| error.to_string())?;
-        transaction
-            .open_table(ATTEMPT_ROLLUP_BUCKET)
-            .map_err(|error| error.to_string())?;
+        open_derived_table(&transaction, REQUEST_ROLLUP_BUCKET)?;
+        open_derived_table(&transaction, REQUEST_ROLLUP_ALL)?;
+        open_derived_table(&transaction, ATTEMPT_ROLLUP_ALL)?;
+        open_derived_table(&transaction, ATTEMPT_ROLLUP_BUCKET)?;
         transaction
             .open_table(STATS_META)
             .map_err(|error| error.to_string())?;
@@ -195,11 +202,15 @@ impl Store {
 
     pub fn ensure_stats_schema(&self) -> Result<(), String> {
         let mut meta = self.stats_meta()?.unwrap_or_default();
-        if meta.version != STATS_SCHEMA_VERSION {
+        if meta.version > STATS_SCHEMA_VERSION {
             return Err(format!(
-                "unsupported statistics schema version {}; expected {STATS_SCHEMA_VERSION}",
+                "unsupported statistics schema version {}; expected at most {STATS_SCHEMA_VERSION}",
                 meta.version
             ));
+        }
+        if meta.version < STATS_SCHEMA_VERSION {
+            self.reset_rollups(STATS_SCHEMA_VERSION)?;
+            meta = self.stats_meta()?.unwrap_or_default();
         }
         loop {
             match meta.phase {
@@ -210,6 +221,79 @@ impl Store {
         }
         self.ensure_attempt_buckets()?;
         self.prune_expired_stats()
+    }
+
+    /// Prepares this data directory for a binary that expects an older statistics
+    /// schema: only the derived rollup tables are dropped and the schema marker is
+    /// rewritten, so that binary rebuilds its own rollups from the untouched ledger.
+    pub fn downgrade_stats_schema(&self, version: u32) -> Result<(), String> {
+        if version >= STATS_SCHEMA_VERSION {
+            return Err(format!(
+                "downgrade target {version} is not older than the current statistics schema {STATS_SCHEMA_VERSION}"
+            ));
+        }
+        self.reset_rollups(version)
+    }
+
+    /// Retained ledger sizes, so a schema change can prove it never dropped records.
+    pub fn ledger_counts(&self) -> Result<(u64, u64), String> {
+        let transaction = self
+            .database
+            .begin_read()
+            .map_err(|error| error.to_string())?;
+        let requests = transaction
+            .open_table(REQUESTS)
+            .map_err(|error| error.to_string())?
+            .len()
+            .map_err(|error| error.to_string())?;
+        let attempts = transaction
+            .open_table(ATTEMPTS)
+            .map_err(|error| error.to_string())?
+            .len()
+            .map_err(|error| error.to_string())?;
+        Ok((requests, attempts))
+    }
+
+    /// Drops every derived statistics table and restarts the resumable backfill at
+    /// `version`. The request and attempt ledgers are untouched, so all-time totals
+    /// are rebuilt exactly and buckets are recreated for whatever the ledger still
+    /// retains.
+    fn reset_rollups(&self, version: u32) -> Result<(), String> {
+        let transaction = self
+            .database
+            .begin_write()
+            .map_err(|error| error.to_string())?;
+        let dropped = [
+            transaction
+                .delete_table(REQUEST_ROLLUP_BUCKET)
+                .map_err(|error| error.to_string())?,
+            transaction
+                .delete_table(REQUEST_ROLLUP_ALL)
+                .map_err(|error| error.to_string())?,
+            transaction
+                .delete_table(ATTEMPT_ROLLUP_ALL)
+                .map_err(|error| error.to_string())?,
+            transaction
+                .delete_table(ATTEMPT_ROLLUP_BUCKET)
+                .map_err(|error| error.to_string())?,
+        ];
+        debug_assert_eq!(dropped.len(), 4);
+        {
+            let mut table = transaction
+                .open_table(STATS_META)
+                .map_err(|error| error.to_string())?;
+            table
+                .remove(ATTEMPT_BUCKET_META_KEY)
+                .map_err(|error| error.to_string())?;
+        }
+        write_stats_meta(
+            &transaction,
+            &StatsMeta {
+                version,
+                ..StatsMeta::default()
+            },
+        )?;
+        transaction.commit().map_err(|error| error.to_string())
     }
 
     pub fn put_state<T: Serialize>(&self, key: &str, value: &T) -> Result<(), String> {
@@ -411,6 +495,117 @@ impl Store {
 
     pub fn attempts(&self, limit: usize) -> Result<Vec<AttemptRecord>, String> {
         self.list(ATTEMPTS, limit)
+    }
+
+    /// Aggregates failed attempts in a window by their upstream error
+    /// type/code pair.
+    ///
+    /// Attempt keys are UUIDv7 values, so reverse iteration visits newest first
+    /// and can stop as soon as a record predates the window. Rows without any
+    /// retained upstream discriminator are grouped under their failure class so
+    /// transport and stream failures stay visible next to provider rejections.
+    pub fn upstream_errors(
+        &self,
+        from_ms: Option<i64>,
+        to_ms: Option<i64>,
+        served_model: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<UpstreamErrorBucket>, String> {
+        const MAX_SCAN: usize = 200_000;
+        let transaction = self
+            .database
+            .begin_read()
+            .map_err(|error| error.to_string())?;
+        let table = transaction
+            .open_table(ATTEMPTS)
+            .map_err(|error| error.to_string())?;
+        type BucketKey = (Option<String>, Option<String>, Option<String>);
+        let mut buckets: BTreeMap<BucketKey, UpstreamErrorBucket> = BTreeMap::new();
+        let mut scanned = 0usize;
+        let mut stale_streak = 0usize;
+        for entry in table.iter().map_err(|error| error.to_string())?.rev() {
+            let (_, value) = entry.map_err(|error| error.to_string())?;
+            let record: AttemptRecord = serde_json::from_slice(value.value())
+                .map_err(|error| format!("attempt record is not valid JSON: {error}"))?;
+            if let Some(from) = from_ms
+                && record.completed_at_ms < from
+            {
+                // Live keys are UUIDv7 values written after completion, so the
+                // reverse scan normally meets the window boundary immediately.
+                // A short tail guards against any row whose key is not
+                // time-ordered without turning this into a full table scan.
+                stale_streak += 1;
+                if stale_streak > 64 {
+                    break;
+                }
+                continue;
+            }
+            stale_streak = 0;
+            scanned += 1;
+            if scanned > MAX_SCAN {
+                break;
+            }
+            if let Some(to) = to_ms
+                && record.completed_at_ms >= to
+            {
+                continue;
+            }
+            if let Some(model) = served_model {
+                let matches = match record.served_model.as_deref() {
+                    Some(served) => served == model,
+                    None => record.upstream_model == model,
+                };
+                if !matches {
+                    continue;
+                }
+            }
+            let failed = record.error_class.is_some()
+                || record.status.is_some_and(|status| status >= 400)
+                || record.upstream_error_type.is_some()
+                || record.upstream_error_code.is_some();
+            if !failed {
+                continue;
+            }
+            let key = (
+                record.upstream_error_type.clone(),
+                record.upstream_error_code.clone(),
+                record.error_class.map(|class| class.as_str().to_string()),
+            );
+            let bucket = buckets.entry(key).or_insert_with(|| UpstreamErrorBucket {
+                upstream_type: record.upstream_error_type.clone(),
+                upstream_code: record.upstream_error_code.clone(),
+                error_class: record.error_class,
+                message: None,
+                backend: Some(record.backend.clone()),
+                count: 0,
+                last_seen_ms: record.completed_at_ms,
+            });
+            bucket.count += 1;
+            if record.completed_at_ms >= bucket.last_seen_ms {
+                bucket.last_seen_ms = record.completed_at_ms;
+                bucket.backend = Some(record.backend.clone());
+                if let Some(message) = record
+                    .upstream_error_message
+                    .clone()
+                    .or_else(|| record.sanitized_error.clone())
+                {
+                    bucket.message = Some(message);
+                }
+            } else if bucket.message.is_none() {
+                bucket.message = record
+                    .upstream_error_message
+                    .clone()
+                    .or_else(|| record.sanitized_error.clone());
+            }
+        }
+        let mut errors = buckets.into_values().collect::<Vec<_>>();
+        errors.sort_by(|a, b| {
+            b.count
+                .cmp(&a.count)
+                .then_with(|| b.last_seen_ms.cmp(&a.last_seen_ms))
+        });
+        errors.truncate(limit.max(1));
+        Ok(errors)
     }
 
     pub fn alerts(&self, limit: usize) -> Result<Vec<AlertRecord>, String> {
@@ -799,9 +994,13 @@ impl From<RequestRollupValue> for RequestRollup {
             errors: value.1,
             fallbacks: value.2,
             input_tokens: value.3,
-            output_tokens: value.4,
-            total_tokens: value.5,
-            bytes: value.6,
+            cache_hit_tokens: value.4,
+            cache_miss_tokens: value.5,
+            reasoning_tokens: value.6,
+            reasoning_estimated_tokens: value.7,
+            output_tokens: value.8,
+            total_tokens: value.9,
+            bytes: value.10,
         }
     }
 }
@@ -813,6 +1012,10 @@ impl From<RequestRollup> for RequestRollupValue {
             value.errors,
             value.fallbacks,
             value.input_tokens,
+            value.cache_hit_tokens,
+            value.cache_miss_tokens,
+            value.reasoning_tokens,
+            value.reasoning_estimated_tokens,
             value.output_tokens,
             value.total_tokens,
             value.bytes,
@@ -826,6 +1029,26 @@ impl RequestRollup {
         self.errors = checked_add(self.errors, other.errors, "errors")?;
         self.fallbacks = checked_add(self.fallbacks, other.fallbacks, "fallbacks")?;
         self.input_tokens = checked_add(self.input_tokens, other.input_tokens, "input tokens")?;
+        self.cache_hit_tokens = checked_add(
+            self.cache_hit_tokens,
+            other.cache_hit_tokens,
+            "cache-hit tokens",
+        )?;
+        self.cache_miss_tokens = checked_add(
+            self.cache_miss_tokens,
+            other.cache_miss_tokens,
+            "cache-miss tokens",
+        )?;
+        self.reasoning_tokens = checked_add(
+            self.reasoning_tokens,
+            other.reasoning_tokens,
+            "reasoning tokens",
+        )?;
+        self.reasoning_estimated_tokens = checked_add(
+            self.reasoning_estimated_tokens,
+            other.reasoning_estimated_tokens,
+            "estimated reasoning tokens",
+        )?;
         self.output_tokens = checked_add(self.output_tokens, other.output_tokens, "output tokens")?;
         self.total_tokens = checked_add(self.total_tokens, other.total_tokens, "total tokens")?;
         self.bytes = checked_add(self.bytes, other.bytes, "bytes")?;
@@ -840,9 +1063,13 @@ impl From<AttemptRollupValue> for AttemptRollup {
             successes: value.1,
             errors: value.2,
             cache_reported_attempts: value.3,
-            cache_hit_tokens: value.4,
-            cache_miss_tokens: value.5,
-            cost_usd: value.6,
+            input_tokens: value.4,
+            cache_hit_tokens: value.5,
+            cache_miss_tokens: value.6,
+            reasoning_tokens: value.7,
+            reasoning_estimated_tokens: value.8,
+            output_tokens: value.9,
+            cost_usd: value.10,
         }
     }
 }
@@ -854,8 +1081,12 @@ impl From<AttemptRollup> for AttemptRollupValue {
             value.successes,
             value.errors,
             value.cache_reported_attempts,
+            value.input_tokens,
             value.cache_hit_tokens,
             value.cache_miss_tokens,
+            value.reasoning_tokens,
+            value.reasoning_estimated_tokens,
+            value.output_tokens,
             value.cost_usd,
         )
     }
@@ -871,6 +1102,7 @@ impl AttemptRollup {
             other.cache_reported_attempts,
             "cache-reported attempts",
         )?;
+        self.input_tokens = checked_add(self.input_tokens, other.input_tokens, "input tokens")?;
         self.cache_hit_tokens = checked_add(
             self.cache_hit_tokens,
             other.cache_hit_tokens,
@@ -881,6 +1113,17 @@ impl AttemptRollup {
             other.cache_miss_tokens,
             "cache-miss tokens",
         )?;
+        self.reasoning_tokens = checked_add(
+            self.reasoning_tokens,
+            other.reasoning_tokens,
+            "reasoning tokens",
+        )?;
+        self.reasoning_estimated_tokens = checked_add(
+            self.reasoning_estimated_tokens,
+            other.reasoning_estimated_tokens,
+            "estimated reasoning tokens",
+        )?;
+        self.output_tokens = checked_add(self.output_tokens, other.output_tokens, "output tokens")?;
         self.cost_usd += other.cost_usd;
         if !self.cost_usd.is_finite() {
             return Err("provider cost overflow".into());
@@ -921,6 +1164,33 @@ fn read_batch<T: DeserializeOwned>(
         }
     }
     Ok(rows)
+}
+
+/// Opens a derived statistics table, replacing one left behind by an older schema
+/// version whose stored key or value type no longer matches. The rebuild triggered
+/// by `ensure_stats_schema` repopulates it from the retained ledger.
+fn open_derived_table<K, V>(
+    transaction: &WriteTransaction,
+    definition: TableDefinition<K, V>,
+) -> Result<(), String>
+where
+    K: redb::Key + 'static,
+    V: redb::Value + 'static,
+{
+    match transaction.open_table(definition) {
+        Ok(_) => Ok(()),
+        Err(redb::TableError::TableTypeMismatch { .. }) => {
+            let name = definition.name();
+            transaction
+                .delete_table(TableDefinition::<K, V>::new(name))
+                .map_err(|error| error.to_string())?;
+            transaction
+                .open_table(TableDefinition::<K, V>::new(name))
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        }
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 fn write_stats_meta(transaction: &WriteTransaction, meta: &StatsMeta) -> Result<(), String> {
@@ -972,6 +1242,10 @@ fn apply_request_rollup(
         errors: u64::from(record.error_class.is_some()),
         fallbacks: u64::from(record.fallback == Some(true)),
         input_tokens: record.usage.input_tokens,
+        cache_hit_tokens: record.usage.cache_hit_tokens,
+        cache_miss_tokens: record.usage.cache_miss_tokens,
+        reasoning_tokens: record.usage.reasoning_tokens,
+        reasoning_estimated_tokens: record.usage.reasoning_estimated_tokens,
         output_tokens: record.usage.output_tokens,
         total_tokens: record.usage.total_tokens,
         bytes: record
@@ -1139,8 +1413,12 @@ fn attempt_delta(record: &AttemptRecord) -> Result<AttemptRollup, String> {
         successes: u64::from(record.error_class.is_none()),
         errors: u64::from(record.error_class.is_some()),
         cache_reported_attempts: u64::from(record.usage.provider_reported),
+        input_tokens: record.usage.input_tokens,
         cache_hit_tokens: record.usage.cache_hit_tokens,
         cache_miss_tokens: record.usage.cache_miss_tokens,
+        reasoning_tokens: record.usage.reasoning_tokens,
+        reasoning_estimated_tokens: record.usage.reasoning_estimated_tokens,
+        output_tokens: record.usage.output_tokens,
         cost_usd: record.provider_cost_usd.unwrap_or(0.0),
     };
     if !delta.cost_usd.is_finite() {
@@ -1362,7 +1640,7 @@ mod tests {
 
     use crate::{
         config::AdapterKind,
-        types::{Protocol, Usage},
+        types::{FailureClass, Protocol, Usage},
     };
 
     #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1471,6 +1749,52 @@ mod tests {
     }
 
     #[test]
+    fn rollups_keep_estimated_reasoning_tokens_separate_from_reported_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.ensure_stats_schema().unwrap();
+        let now = floor_to(Utc::now().timestamp_millis(), MINUTE_MS) - MINUTE_MS;
+
+        let mut reported = request_record("reported-thinking", now);
+        reported.usage.reasoning_tokens = 5;
+        reported.usage.reasoning_reported = true;
+        reported.usage.reasoning_estimated_tokens = 0;
+        store.record_request(&reported).unwrap();
+
+        let mut estimated = request_record("estimated-thinking", now + 1_000);
+        estimated.usage.reasoning_tokens = 0;
+        estimated.usage.reasoning_reported = false;
+        estimated.usage.reasoning_estimated_tokens = 7;
+        store.record_request(&estimated).unwrap();
+
+        let mut reported_attempt = attempt_record("reported-thinking-attempt", now);
+        reported_attempt.usage.reasoning_tokens = 5;
+        reported_attempt.usage.reasoning_reported = true;
+        reported_attempt.usage.reasoning_estimated_tokens = 0;
+        store.record_attempt(&reported_attempt).unwrap();
+
+        let mut estimated_attempt = attempt_record("estimated-thinking-attempt", now + 1_000);
+        estimated_attempt.usage.reasoning_tokens = 0;
+        estimated_attempt.usage.reasoning_reported = false;
+        estimated_attempt.usage.reasoning_estimated_tokens = 7;
+        store.record_attempt(&estimated_attempt).unwrap();
+
+        let all = store.routing_rollup("served", None, None).unwrap();
+        assert_eq!(all.total.calls, 2);
+        assert_eq!(all.total.reasoning_tokens, 5);
+        assert_eq!(all.total.reasoning_estimated_tokens, 7);
+
+        let attempts = store.overview_rollup().unwrap();
+        let row = attempts
+            .attempts
+            .values()
+            .next()
+            .expect("attempt rollup row");
+        assert_eq!(row.reasoning_tokens, 5);
+        assert_eq!(row.reasoning_estimated_tokens, 7);
+    }
+
+    #[test]
     fn records_and_queries_request_rollups_without_double_counting() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
@@ -1484,6 +1808,9 @@ mod tests {
         let all = store.routing_rollup("served", None, None).unwrap();
         assert_eq!(all.total.calls, 1);
         assert_eq!(all.total.input_tokens, 10);
+        assert_eq!(all.total.cache_hit_tokens, 4);
+        assert_eq!(all.total.cache_miss_tokens, 6);
+        assert_eq!(all.total.reasoning_tokens, 2);
         assert_eq!(all.total.output_tokens, 3);
         assert_eq!(all.targets.len(), 1);
         let (target, value) = all.targets.first_key_value().unwrap();
@@ -1572,7 +1899,150 @@ mod tests {
         assert_eq!(attempt_stats.cache_reported_attempts, 1);
         assert_eq!(attempt_stats.cache_hit_tokens, 4);
         assert_eq!(attempt_stats.cache_miss_tokens, 6);
+        assert_eq!(attempt_stats.input_tokens, 10);
+        assert_eq!(attempt_stats.reasoning_tokens, 2);
+        assert_eq!(attempt_stats.output_tokens, 3);
         assert_eq!(attempt_stats.cost_usd, 0.25);
+    }
+
+    #[test]
+    fn upgrades_version_one_rollups_by_rebuilding_them_from_the_ledger() {
+        type VersionOneValue = (u64, u64, u64, u64, u64, u64, u64);
+        const VERSION_ONE_ALL: TableDefinition<RequestAllKey<'static>, VersionOneValue> =
+            TableDefinition::new("request_rollup_all_v1");
+
+        let dir = tempfile::tempdir().unwrap();
+        let now = Utc::now().timestamp_millis();
+        {
+            let database = Database::create(dir.path().join("quotamux.redb")).unwrap();
+            let transaction = database.begin_write().unwrap();
+            for (definition, id, record) in [
+                (
+                    REQUESTS,
+                    "legacy-request",
+                    serde_json::to_vec(&request_record("legacy-request", now)).unwrap(),
+                ),
+                (
+                    ATTEMPTS,
+                    "legacy-attempt",
+                    serde_json::to_vec(&attempt_record("legacy-attempt", now)).unwrap(),
+                ),
+            ] {
+                let mut table = transaction.open_table(definition).unwrap();
+                table.insert(id, record.as_slice()).unwrap();
+            }
+            {
+                let mut table = transaction.open_table(VERSION_ONE_ALL).unwrap();
+                table
+                    .insert(
+                        ("served", SCOPE_MODEL, 0, "", "", "", ""),
+                        (99, 0, 0, 990, 990, 990, 0),
+                    )
+                    .unwrap();
+            }
+            {
+                let mut table = transaction.open_table(STATS_META).unwrap();
+                let meta = serde_json::to_vec(&StatsMeta {
+                    version: 1,
+                    phase: StatsPhase::Ready,
+                    request_cursor: None,
+                    attempt_cursor: None,
+                    migrated_requests: 0,
+                    migrated_attempts: 0,
+                })
+                .unwrap();
+                table.insert(STATS_META_KEY, meta.as_slice()).unwrap();
+            }
+            transaction.commit().unwrap();
+        }
+
+        let store = Store::open(dir.path()).unwrap();
+        store.ensure_stats_schema().unwrap();
+        store.ensure_stats_schema().unwrap();
+
+        let rollup = store.routing_rollup("served", None, None).unwrap();
+        assert_eq!(rollup.total.calls, 1, "stale version-one rows must be gone");
+        assert_eq!(rollup.total.input_tokens, 10);
+        assert_eq!(rollup.total.cache_hit_tokens, 4);
+        assert_eq!(rollup.total.cache_miss_tokens, 6);
+        assert_eq!(rollup.total.reasoning_tokens, 2);
+        assert_eq!(rollup.total.total_tokens, 13);
+        let overview = store.overview_rollup().unwrap();
+        let attempts = overview
+            .attempts
+            .get(&("provider".into(), "upstream".into()))
+            .unwrap();
+        assert_eq!(attempts.attempts, 1);
+        assert_eq!(attempts.input_tokens, 10);
+        assert_eq!(attempts.cache_hit_tokens, 4);
+        assert_eq!(attempts.cache_miss_tokens, 6);
+        assert_eq!(attempts.reasoning_tokens, 2);
+        assert_eq!(attempts.output_tokens, 3);
+        assert_eq!(store.requests(10).unwrap().len(), 1);
+        assert_eq!(store.attempts(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn downgrades_the_statistics_schema_without_touching_the_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.ensure_stats_schema().unwrap();
+        let now = floor_to(Utc::now().timestamp_millis(), MINUTE_MS);
+        store
+            .record_request(&request_record("request-1", now))
+            .unwrap();
+        store
+            .record_attempt(&attempt_record("attempt-1", now))
+            .unwrap();
+        let before = store.ledger_counts().unwrap();
+        assert_eq!(before, (1, 1));
+
+        store.downgrade_stats_schema(1).unwrap();
+        assert_eq!(store.stats_meta().unwrap().unwrap().version, 1);
+        assert_eq!(store.ledger_counts().unwrap(), before);
+        assert_eq!(
+            store.requests(10).unwrap()[0].usage.cache_miss_tokens,
+            6,
+            "the retained ledger keeps its usage detail"
+        );
+        assert!(
+            store.downgrade_stats_schema(STATS_SCHEMA_VERSION).is_err(),
+            "only an older target version may be requested"
+        );
+
+        // The current binary rebuilds its own rollups from the same ledger.
+        store.ensure_stats_schema().unwrap();
+        let rollup = store.routing_rollup("served", None, None).unwrap();
+        assert_eq!(rollup.total.calls, 1);
+        assert_eq!(rollup.total.cache_hit_tokens, 4);
+        assert_eq!(rollup.total.cache_miss_tokens, 6);
+        assert_eq!(rollup.total.reasoning_tokens, 2);
+        let attempts = store
+            .overview_rollup()
+            .unwrap()
+            .attempts
+            .get(&("provider".into(), "upstream".into()))
+            .copied()
+            .unwrap();
+        assert_eq!(attempts.attempts, 1);
+        assert_eq!(attempts.cache_hit_tokens, 4);
+    }
+
+    #[test]
+    fn rejects_a_future_statistics_schema_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let transaction = store.database.begin_write().unwrap();
+        write_stats_meta(
+            &transaction,
+            &StatsMeta {
+                version: STATS_SCHEMA_VERSION + 1,
+                ..StatsMeta::default()
+            },
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        assert!(store.ensure_stats_schema().is_err());
     }
 
     #[test]
@@ -1903,6 +2373,98 @@ mod tests {
     }
 
     #[test]
+    fn aggregates_upstream_errors_by_retained_type_and_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.ensure_stats_schema().unwrap();
+        let to = floor_to(Utc::now().timestamp_millis(), MINUTE_MS);
+        let mut failure = attempt_record("context-limit", to - MINUTE_MS);
+        failure.status = Some(400);
+        failure.error_class = Some(FailureClass::ClientRequest);
+        failure.upstream_error_type = Some("invalid_request_error".into());
+        failure.upstream_error_code = Some("invalid_request_error".into());
+        failure.upstream_error_message = Some("maximum context length is 1048576 tokens".into());
+        failure.sanitized_error = Some("upstream request failed".into());
+        store.record_attempt(&failure).unwrap();
+        let mut repeat = attempt_record("context-limit-2", to - 2 * MINUTE_MS);
+        repeat.status = Some(400);
+        repeat.error_class = Some(FailureClass::ClientRequest);
+        repeat.upstream_error_type = Some("invalid_request_error".into());
+        repeat.upstream_error_code = Some("invalid_request_error".into());
+        repeat.upstream_error_message = Some("older sample".into());
+        store.record_attempt(&repeat).unwrap();
+        let mut other_model = attempt_record("zhipu-limit", to - MINUTE_MS);
+        other_model.backend = "zhipu-coding-plan".into();
+        other_model.upstream_model = "glm-5.3-flash".into();
+        other_model.served_model = Some("glm-5.3-flash".into());
+        other_model.status = Some(400);
+        other_model.error_class = Some(FailureClass::ClientRequest);
+        other_model.upstream_error_type = Some("invalid_request_error".into());
+        other_model.upstream_error_code = Some("1210".into());
+        other_model.upstream_error_message = Some("max_tokens parameter is illegal".into());
+        store.record_attempt(&other_model).unwrap();
+        store
+            .record_attempt(&attempt_record("success", to - MINUTE_MS))
+            .unwrap();
+        store
+            .record_attempt(&attempt_record("old-failure", to - 48 * HOUR_MS))
+            .unwrap();
+
+        let day = store
+            .upstream_errors(Some(to - 24 * HOUR_MS), Some(to), None, 12)
+            .unwrap();
+        assert_eq!(day.len(), 2, "successful and out-of-window rows stay out");
+        assert_eq!(
+            day[0].upstream_code.as_deref(),
+            Some("invalid_request_error")
+        );
+        assert_eq!(day[0].count, 2, "same type/code pair aggregates together");
+        assert_eq!(
+            day[0].message.as_deref(),
+            Some("maximum context length is 1048576 tokens"),
+            "newest sample supplies the message"
+        );
+        assert_eq!(day[1].upstream_code.as_deref(), Some("1210"));
+        assert_eq!(day[1].backend.as_deref(), Some("zhipu-coding-plan"));
+
+        let scoped = store
+            .upstream_errors(Some(to - 24 * HOUR_MS), Some(to), Some("glm-5.3-flash"), 12)
+            .unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].count, 1);
+
+        // Rows recorded before upstream detail existed still separate by class
+        // instead of collapsing into one anonymous bucket.
+        let mut legacy = attempt_record("legacy-transport", to - MINUTE_MS);
+        legacy.status = Some(502);
+        legacy.error_class = Some(FailureClass::ProviderTransient);
+        legacy.upstream_error_type = None;
+        legacy.upstream_error_code = None;
+        legacy.upstream_error_message = None;
+        legacy.sanitized_error = Some("upstream transport failure".into());
+        store.record_attempt(&legacy).unwrap();
+        let mut legacy_client = attempt_record("legacy-client", to - MINUTE_MS);
+        legacy_client.status = Some(400);
+        legacy_client.error_class = Some(FailureClass::ClientRequest);
+        legacy_client.upstream_error_type = None;
+        legacy_client.upstream_error_code = None;
+        legacy_client.upstream_error_message = None;
+        legacy_client.sanitized_error = Some("upstream request failed".into());
+        store.record_attempt(&legacy_client).unwrap();
+        let legacy_buckets = store
+            .upstream_errors(Some(to - 24 * HOUR_MS), Some(to), None, 12)
+            .unwrap();
+        assert_eq!(legacy_buckets.len(), 4);
+        let classes = legacy_buckets
+            .iter()
+            .filter(|bucket| bucket.upstream_code.is_none())
+            .map(|bucket| bucket.error_class)
+            .collect::<Vec<_>>();
+        assert!(classes.contains(&Some(FailureClass::ProviderTransient)));
+        assert!(classes.contains(&Some(FailureClass::ClientRequest)));
+    }
+
+    #[test]
     fn day_window_excludes_old_rows_but_lifetime_and_reopen_preserve_them() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
@@ -2048,7 +2610,9 @@ mod tests {
                 input_tokens: 10,
                 cache_hit_tokens: 4,
                 cache_miss_tokens: 6,
-                reasoning_tokens: 0,
+                reasoning_tokens: 2,
+                reasoning_reported: true,
+                reasoning_estimated_tokens: 0,
                 output_tokens: 3,
                 total_tokens: 13,
                 provider_reported: true,
@@ -2056,6 +2620,9 @@ mod tests {
             claude_session_id: None,
             claude_agent_id: None,
             claude_parent_agent_id: None,
+            upstream_error_type: None,
+            upstream_error_code: None,
+            upstream_error_message: None,
         }
     }
 
@@ -2072,6 +2639,7 @@ mod tests {
             selection_reason: Some("single-target".into()),
             matched_prefix_bytes: None,
             upstream_model: "upstream".into(),
+            served_model: Some("served".into()),
             egress_protocol: Protocol::OpenAiChat,
             translated: false,
             probe: false,
@@ -2088,6 +2656,9 @@ mod tests {
             usage: request_record("usage", started_at_ms).usage,
             provider_cost_usd: Some(0.25),
             sanitized_error: None,
+            upstream_error_type: None,
+            upstream_error_code: None,
+            upstream_error_message: None,
         }
     }
 }
