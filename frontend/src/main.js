@@ -91,9 +91,35 @@ function refs(path) {
   return `<div class="target-editor">${field(path + ".backend", "Account", "text", ["", ...state.draft.backends.map((b) => b.id)])}${field(path + ".credential", "Credential", "text", ["", ...(backend?.credentials || []).map((c) => c.id)])}${field(path + ".model", "Upstream model", "text", ["", ...(backend?.models || []).map((m) => m.name)])}${button("remove", "Remove target", path)}</div>`;
 }
 let signinTimer = 0;
+let signinTicker = 0;
 function scheduleSigninPoll(seconds) {
   clearTimeout(signinTimer);
   signinTimer = setTimeout(pollSignin, Math.max(1, seconds) * 1000);
+}
+function stopSigninTimers() {
+  clearTimeout(signinTimer);
+  clearInterval(signinTicker);
+}
+function tickSigninCountdown() {
+  const node = document.querySelector("[data-signin-countdown]");
+  const s = state.signin;
+  if (!node || !s || s.status !== "pending") return;
+  const left = Math.max(0, Math.round((s.expires_at - Date.now()) / 1000));
+  node.textContent = `Expires in ${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")}`;
+}
+async function startSignin(path, note) {
+  try {
+    const res = await request("/api/copilot/sign-in", { method: "POST" });
+    state.signin = { path, status: "pending", note, ...res, expires_at: Date.now() + res.expires_in * 1000 };
+    render();
+    scheduleSigninPoll(state.signin.interval || 5);
+    clearInterval(signinTicker);
+    signinTicker = setInterval(tickSigninCountdown, 1000);
+    tickSigninCountdown();
+  } catch (e) {
+    state.signin = { path, status: "error", message: String(e?.message || e) };
+    render();
+  }
 }
 async function pollSignin() {
   const s = state.signin;
@@ -105,8 +131,13 @@ async function pollSignin() {
       body: JSON.stringify({ device_code: s.device_code }),
     });
   } catch (e) {
-    state.signin = { ...s, status: "error", message: String(e?.message || e) };
-    render();
+    if ((s.retries || 0) + 1 < 3) {
+      state.signin = { ...s, retries: (s.retries || 0) + 1 };
+      scheduleSigninPoll(5);
+    } else {
+      state.signin = { ...s, status: "error", message: String(e?.message || e) };
+      render();
+    }
     return;
   }
   if (res.status === "pending") {
@@ -114,6 +145,7 @@ async function pollSignin() {
     return;
   }
   if (res.status === "complete") {
+    stopSigninTimers();
     state.signin = null;
     if (get(s.path)) {
       set(`${s.path}.api_key`, res.token);
@@ -124,6 +156,11 @@ async function pollSignin() {
     render();
     return;
   }
+  if (res.status === "expired") {
+    startSignin(s.path, "The previous code expired; a new one was requested.");
+    return;
+  }
+  stopSigninTimers();
   state.signin = { ...s, status: res.status };
   render();
 }
@@ -134,7 +171,7 @@ function copilotPanel() {
     return `<article class="signin"><h3>GitHub sign-in</h3><p class="muted">${s.status === "expired" ? "The device code expired." : "The authorization request was denied."}</p>${button("copilot-signin", "Try again", s.path)}</article>`;
   if (s.status === "error")
     return `<article class="signin"><h3>GitHub sign-in</h3><p class="muted">${esc(s.message || "GitHub could not be reached.")}</p>${button("copilot-signin", "Try again", s.path)}</article>`;
-  return `<article class="signin"><h3>GitHub sign-in</h3><p>Open <a href="${esc(s.verification_uri)}" target="_blank" rel="noreferrer">${esc(s.verification_uri)}</a> and enter this code:</p><p class="device-code">${esc(s.user_code)}</p><p class="muted">Waiting for authorization…</p>${button("copilot-signin-cancel", "Cancel")}</article>`;
+  return `<article class="signin"><h3>GitHub sign-in</h3>${s.note ? `<p class="muted">${esc(s.note)}</p>` : ""}<p>Open <a href="${esc(s.verification_uri)}" target="_blank" rel="noreferrer">${esc(s.verification_uri)}</a> and enter this code:</p><p class="device-code">${esc(s.user_code)}</p><p class="muted">Waiting for authorization… <span data-signin-countdown></span></p>${button("copilot-signin-cancel", "Cancel")}</article>`;
 }
 function render() {
   if (!state.draft) {
@@ -908,7 +945,7 @@ app.addEventListener("click", async (event) => {
       return;
     }
     if (a === "disable-edit") {
-      clearTimeout(signinTimer);
+      stopSigninTimers();
       state.signin = null;
       if (state.dirty) {
         if (!confirm("Discard unsaved changes and disable editing?")) return;
@@ -919,18 +956,11 @@ app.addEventListener("click", async (event) => {
       return;
     }
     if (a === "copilot-signin") {
-      try {
-        const res = await request("/api/copilot/sign-in", { method: "POST" });
-        state.signin = { path: p, status: "pending", ...res };
-      } catch (e) {
-        state.signin = { path: p, status: "error", message: String(e?.message || e) };
-      }
-      render();
-      scheduleSigninPoll(state.signin?.interval || 5);
+      await startSignin(p);
       return;
     }
     if (a === "copilot-signin-cancel") {
-      clearTimeout(signinTimer);
+      stopSigninTimers();
       state.signin = null;
       render();
       return;
