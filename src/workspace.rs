@@ -112,8 +112,11 @@ impl Workspace {
     pub fn router(self: &Arc<Self>) -> Router {
         Router::new()
             .route("/api/routing", get(read).put(save))
-            .route("/api/copilot/sign-in", post(copilot_sign_in))
-            .route("/api/copilot/sign-in/poll", post(copilot_sign_in_poll))
+            .route("/api/github-copilot/sign-in", post(copilot_sign_in))
+            .route(
+                "/api/github-copilot/sign-in/poll",
+                post(copilot_sign_in_poll),
+            )
             .layer(DefaultBodyLimit::max(1024 * 1024))
             .fallback(dispatch)
             .with_state(self.clone())

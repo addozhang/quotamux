@@ -62,7 +62,7 @@ const adapters = [
   "kimi-official",
   "kimi-code",
   "zhipu-coding-plan",
-  "copilot",
+  "github-copilot",
   "custom-chat-completions",
   "custom-responses",
   "custom-anthropic",
@@ -109,7 +109,7 @@ function tickSigninCountdown() {
 }
 async function startSignin(path, note) {
   try {
-    const res = await request("/api/copilot/sign-in", { method: "POST" });
+    const res = await request("/api/github-copilot/sign-in", { method: "POST" });
     state.signin = { path, status: "pending", note, ...res, expires_at: Date.now() + res.expires_in * 1000 };
     render();
     scheduleSigninPoll(state.signin.interval || 5);
@@ -125,7 +125,7 @@ async function startSignin(path, note) {
   if (!s || s.status !== "pending") return;
   let res;
   try {
-    res = await request("/api/copilot/sign-in/poll", {
+    res = await request("/api/github-copilot/sign-in/poll", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ device_code: s.device_code }),
@@ -260,7 +260,7 @@ function accountEditor(b, i) {
       return `<p class="muted">Credentials stay blank when loaded. Leave an existing key blank to preserve it.</p><article><div class="heading"><h3 data-account-heading>${esc(displayName(b.id || "New account"))}</h3>${button("remove", "Delete account", p)}</div><div class="row">${field(p + ".id", "Account ID")}${field(p + ".adapter", "Adapter", "text", adapters)}</div>${b.adapter.startsWith("custom-") ? field(p + ".endpoint", "Endpoint URL (blank preserves existing)") : '<p class="muted">Official endpoint managed by adapter</p>'}<h4>Credentials</h4>${b.credentials
         .map((c, j) => {
           const q = `${p}.credentials.${j}`;
-          return `<div class="credential"><div class="row">${field(q + ".id", "Credential ID")}${field(q + ".api_key", "API key (blank preserves existing)", "password")}${field(q + ".pool", "Shared pool", "text", ["", ...(state.draft.capacity_pools || []).map((p) => p.id)])}</div>${!c.pool ? button("add-pool", "Create capacity pool", q) : ""}${b.adapter === "copilot" ? button("copilot-signin", "Sign in with GitHub", q) : ""}${button("remove", "Delete credential", q)}</div>`;
+          return `<div class="credential"><div class="row">${field(q + ".id", "Credential ID")}${field(q + ".api_key", "API key (blank preserves existing)", "password")}${field(q + ".pool", "Shared pool", "text", ["", ...(state.draft.capacity_pools || []).map((p) => p.id)])}</div>${!c.pool ? button("add-pool", "Create capacity pool", q) : ""}${b.adapter === "github-copilot" ? button("copilot-signin", "Sign in with GitHub", q) : ""}${button("remove", "Delete credential", q)}</div>`;
         })
         .join(
           "",
@@ -850,7 +850,7 @@ app.addEventListener("change", (event) => {
       "kimi-code": ["openai-chat", "anthropic-messages"],
       "kimi-official": ["openai-chat"],
       "ollama-cloud": ["openai-chat"],
-      copilot: ["openai-chat"],
+      "github-copilot": ["openai-chat"],
     };
     backend.models.forEach(
       (model) =>

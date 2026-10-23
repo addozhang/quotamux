@@ -134,7 +134,7 @@ pub enum AdapterKind {
     OpenCodeGo,
     #[serde(rename = "zhipu-coding-plan")]
     ZhipuCodingPlan,
-    #[serde(rename = "copilot")]
+    #[serde(rename = "github-copilot")]
     Copilot,
     #[serde(rename = "custom-chat-completions")]
     CustomChatCompletions,
@@ -155,7 +155,7 @@ impl AdapterKind {
             Self::OpenCodeZen => "opencode-zen",
             Self::OpenCodeGo => "opencode-go",
             Self::ZhipuCodingPlan => "zhipu-coding-plan",
-            Self::Copilot => "copilot",
+            Self::Copilot => "github-copilot",
             Self::CustomChatCompletions => "custom-chat-completions",
             Self::CustomResponses => "custom-responses",
             Self::CustomAnthropic => "custom-anthropic",

@@ -10,7 +10,7 @@ use std::{fs, path::Path, sync::Arc};
 use tower::ServiceExt;
 
 fn config(path: &Path) -> String {
-    let value = json!({"config_version":4,"server":{"listen":"127.0.0.1:0","data_dir":path.join("data")},"backends":[{"id":"copilot","adapter":"copilot","credentials":[{"id":"copilot-token","api_key":"placeholder"}],"models":[{"name":"gpt-5","protocols":["openai-chat"]}]}],"models":[{"name":"gpt-5","protocols":["openai-chat"],"layers":[{"name":"copilot","strategy":"random","targets":[{"backend":"copilot","credential":"copilot-token","model":"gpt-5"}]}]}]});
+    let value = json!({"config_version":4,"server":{"listen":"127.0.0.1:0","data_dir":path.join("data")},"backends":[{"id":"copilot","adapter":"github-copilot","credentials":[{"id":"copilot-token","api_key":"placeholder"}],"models":[{"name":"gpt-5","protocols":["openai-chat"]}]}],"models":[{"name":"gpt-5","protocols":["openai-chat"],"layers":[{"name":"copilot","strategy":"random","targets":[{"backend":"copilot","credential":"copilot-token","model":"gpt-5"}]}]}]});
     toml::to_string_pretty(&value).unwrap()
 }
 
@@ -86,7 +86,7 @@ async fn copilot_sign_in_routes_drive_the_device_flow() {
     fs::write(&path, config(dir.path())).unwrap();
     let workspace = Workspace::open(&path).await.unwrap();
 
-    let (status, started) = call(&workspace, "/api/copilot/sign-in", None, None).await;
+    let (status, started) = call(&workspace, "/api/github-copilot/sign-in", None, None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(started["user_code"], "ABCD-1234");
     assert_eq!(started["device_code"], "device-1");
@@ -97,7 +97,7 @@ async fn copilot_sign_in_routes_drive_the_device_flow() {
 
     let (status, polled) = call(
         &workspace,
-        "/api/copilot/sign-in/poll",
+        "/api/github-copilot/sign-in/poll",
         Some(("device_code", started["device_code"].clone())),
         None,
     )
@@ -109,7 +109,7 @@ async fn copilot_sign_in_routes_drive_the_device_flow() {
 
     let (status, body) = call(
         &workspace,
-        "/api/copilot/sign-in/poll",
+        "/api/github-copilot/sign-in/poll",
         Some(("device_code", json!(""))),
         None,
     )
@@ -119,7 +119,7 @@ async fn copilot_sign_in_routes_drive_the_device_flow() {
 
     let (status, _) = call(
         &workspace,
-        "/api/copilot/sign-in",
+        "/api/github-copilot/sign-in",
         None,
         Some("https://dashboard.example"),
     )

@@ -288,7 +288,7 @@ error.
 | `kimi-code` | `https://api.kimi.com/coding/v1` | Chat, Anthropic |
 | `kimi-official` | `https://api.moonshot.cn/v1` | Chat |
 | `zhipu-coding-plan` | `https://open.bigmodel.cn/api` | Chat, Responses, Anthropic |
-| `copilot` | `https://api.githubcopilot.com` | Chat, Responses |
+| `github-copilot` | `https://api.githubcopilot.com` | Chat, Responses |
 
 For `opencode-go`, the adapter contains the official model-to-protocol catalog.
 Declare only the exact model ID and omit `protocols`:
@@ -320,64 +320,23 @@ the [OpenCode GLM-5.3-Flash model data](https://opencode.ai/data/zhipu/glm-5-3-f
 
 ### GitHub Copilot
 
-The `copilot` adapter talks to the Copilot API at
-`https://api.githubcopilot.com` over native OpenAI Chat and OpenAI Responses.
-Some Copilot models are only accessible through the Responses API
-(`unsupported_api_for_model` on `/chat/completions`); declare
-`protocols = ["openai-responses"]` for those so Chat and Anthropic Messages
-requests are translated at the protocol boundary.
+The `github-copilot` adapter talks to `https://api.githubcopilot.com` with
+native Chat and Responses egress. List the model IDs enabled on your plan
+with `curl -H "Authorization: Bearer $TOKEN" https://api.githubcopilot.com/models`;
+newer models such as `gpt-6-sol` only serve the Responses API, so declare
+`protocols = ["openai-responses"]` for them and Chat or Anthropic Messages
+ingress is translated at the protocol boundary.
 
-Obtain the credential token through GitHub's device flow with the login
-helper. It always uses GitHub's own Copilot editor App (`Iv1.b507a08c87ecfe98`),
-because the Copilot API only accepts tokens issued to Apps it recognizes:
+Get the token once through GitHub's device flow: the **Sign in with GitHub**
+button on a Copilot credential in the Accounts page, or the login helper.
 
 ```sh
 cargo run --bin quotamux-copilot-login
-# Or inside the container image:
 docker compose run --rm --entrypoint /quotamux-copilot-login quotamux
 ```
 
-The dashboard can trigger the same flow: on the Accounts page, a `copilot`
-credential offers **Sign in with GitHub** while editing. The gateway calls
-GitHub (the browser cannot; GitHub sends no CORS headers), shows the
-verification code, polls until the operator authorizes, and fills the token
-into the credential field. Save then validates and activates it like any
-other configuration change.
-
-Open the printed verification URI, enter the user code, and authorize. The
-helper prints the token plus the GitHub login it belongs to; paste the token
-as the `api_key` of the copilot backend credential. The token does not expire
-and QuotaMux never refreshes or persists it anywhere except your
-configuration. If GitHub revokes it, upstream attempts fail with `401`,
-open the authentication circuit, and the operator simply logs in again.
-
-Discover the model IDs enabled on your plan before declaring backend models:
-
-```sh
-curl -H "Authorization: Bearer $TOKEN" https://api.githubcopilot.com/models
-```
-
-```toml
-[[backends]]
-id = "copilot"
-adapter = "copilot"
-
-[[backends.credentials]]
-id = "copilot-token"
-api_key = "github-device-flow-token"
-
-[[backends.models]]
-# Chat-native model:
-# name = "claude-sonnet-5.5"
-# protocols = ["openai-chat"]
-# Responses-only model:
-name = "gpt-6-sol"
-protocols = ["openai-responses"]
-```
-
-Copilot failures use generic HTTP classification. Plan quota pressure
-surfaces as `429` and is treated as capacity pressure, so a busy window
-backs off that one target without affecting other backends.
+The token does not expire and nothing refreshes it; if GitHub revokes it,
+attempts fail with `401` and signing in again replaces it.
 
 ### Custom adapters
 
