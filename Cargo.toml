@@ -23,7 +23,7 @@ getrandom = "0.4.3"
 httpdate = "1.0.3"
 embedded-spa = { git = "https://github.com/tomcatzh/embedded-spa", tag = "v0.1.1" }
 redb = "4.1.0"
-reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "http2", "json", "stream"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "http2", "json", "stream", "form"] }
 rust-embed = { version = "8", features = ["debug-embed", "deterministic-timestamps"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.149"

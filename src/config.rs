@@ -134,6 +134,8 @@ pub enum AdapterKind {
     OpenCodeGo,
     #[serde(rename = "zhipu-coding-plan")]
     ZhipuCodingPlan,
+    #[serde(rename = "copilot")]
+    Copilot,
     #[serde(rename = "custom-chat-completions")]
     CustomChatCompletions,
     #[serde(rename = "custom-responses")]
@@ -153,6 +155,7 @@ impl AdapterKind {
             Self::OpenCodeZen => "opencode-zen",
             Self::OpenCodeGo => "opencode-go",
             Self::ZhipuCodingPlan => "zhipu-coding-plan",
+            Self::Copilot => "copilot",
             Self::CustomChatCompletions => "custom-chat-completions",
             Self::CustomResponses => "custom-responses",
             Self::CustomAnthropic => "custom-anthropic",
@@ -919,6 +922,33 @@ data_dir = "data"
         ] {
             assert!(adapter.supports_protocol(protocol));
         }
+    }
+
+    #[test]
+    fn copilot_owns_its_endpoint_and_accepts_chat_only() {
+        let adapter = adapter_for(AdapterKind::Copilot).unwrap();
+        assert_eq!(
+            adapter.endpoint_policy(),
+            EndpointPolicy::Official("https://api.githubcopilot.com")
+        );
+
+        let mut config = valid();
+        config.backends[0].adapter = AdapterKind::Copilot;
+        config.backends[0].models[0].name = "gpt-5".into();
+        config.backends[0].models[0].protocols = vec![Protocol::OpenAiChat];
+        config.models[0].layers[0].targets[0].model = "gpt-5".into();
+        config.validate().unwrap();
+
+        assert!(adapter.supports_protocol(Protocol::OpenAiChat));
+        assert!(!adapter.supports_protocol(Protocol::OpenAiResponses));
+        assert!(!adapter.supports_protocol(Protocol::AnthropicMessages));
+
+        config.backends[0].models[0].protocols = vec![Protocol::OpenAiResponses];
+        assert!(config.validate().is_err());
+
+        config.backends[0].models[0].protocols = vec![Protocol::OpenAiChat];
+        config.backends[0].endpoint = Some("https://gateway.example/v1/chat/completions".into());
+        assert!(config.validate().is_err());
     }
 
     #[test]

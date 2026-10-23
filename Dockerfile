@@ -12,8 +12,8 @@ COPY src ./src
 RUN --mount=type=cache,id=quotamux-routing-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=quotamux-routing-cargo-git-${TARGETARCH},target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=quotamux-routing-target-${TARGETARCH},target=/src/target,sharing=locked \
-    cargo build --release --locked --bin quotamux --bin quotamux-smoke && \
-    mkdir -p /out && cp target/release/quotamux target/release/quotamux-smoke /out/
+    cargo build --release --locked --bin quotamux --bin quotamux-smoke --bin quotamux-copilot-login && \
+    mkdir -p /out && cp target/release/quotamux target/release/quotamux-smoke target/release/quotamux-copilot-login /out/
 RUN mkdir -p /runtime-data
 
 FROM scratch

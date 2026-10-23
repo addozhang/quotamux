@@ -16,4 +16,5 @@ pub use config::Config;
 
 pub mod admission;
 pub mod calendar;
+pub mod copilot_login;
 pub mod workspace;

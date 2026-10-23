@@ -7,6 +7,7 @@ use crate::{
 
 use super::{ErrorDetails, classify_status};
 
+mod copilot;
 mod custom;
 mod deepseek_official;
 mod kimi_code;
@@ -62,6 +63,7 @@ pub fn adapter_for(kind: AdapterKind) -> Option<&'static dyn ProviderAdapter> {
         AdapterKind::KimiCode => Some(&kimi_code::KIMI_CODE),
         AdapterKind::OpenCodeGo => Some(&opencode_go::OPENCODE_GO),
         AdapterKind::ZhipuCodingPlan => Some(&zhipu_coding_plan::ZHIPU_CODING_PLAN),
+        AdapterKind::Copilot => Some(&copilot::COPILOT),
         AdapterKind::CustomChatCompletions => Some(&custom::CUSTOM_CHAT_COMPLETIONS),
         AdapterKind::CustomResponses => Some(&custom::CUSTOM_RESPONSES),
         AdapterKind::CustomAnthropic => Some(&custom::CUSTOM_ANTHROPIC),

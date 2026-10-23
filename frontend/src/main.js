@@ -61,6 +61,7 @@ const adapters = [
   "kimi-official",
   "kimi-code",
   "zhipu-coding-plan",
+  "copilot",
   "custom-chat-completions",
   "custom-responses",
   "custom-anthropic",
@@ -763,6 +764,7 @@ app.addEventListener("change", (event) => {
       "kimi-code": ["openai-chat", "anthropic-messages"],
       "kimi-official": ["openai-chat"],
       "ollama-cloud": ["openai-chat"],
+      copilot: ["openai-chat"],
     };
     backend.models.forEach(
       (model) =>

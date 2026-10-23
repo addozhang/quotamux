@@ -183,6 +183,23 @@ api_key = ""
 name = "k3"
 protocols = ["openai-chat", "anthropic-messages"]
 
+# GitHub Copilot. Obtain the token once with the device-flow helper and paste
+# it below; it does not expire.
+#   cargo run --bin quotamux-copilot-login
+[[backends]]
+id = "copilot"
+adapter = "copilot"
+
+[[backends.credentials]]
+id = "copilot-token"
+api_key = ""
+
+[[backends.models]]
+# Set the exact model IDs enabled on your Copilot plan:
+#   curl -H "Authorization: Bearer $TOKEN" https://api.githubcopilot.com/models
+name = "gpt-5"
+protocols = ["openai-chat"]
+
 [[backends]]
 id = "deepseek"
 adapter = "deepseek-official"
@@ -393,6 +410,18 @@ name = "kimi-code-allegretto"
 strategy = "random"
 targets = [
   { backend = "kimi-code", credential = "kimi-code-allegretto", model = "k3" },
+]
+
+# GitHub Copilot. Responses/Anthropic requests are translated to Chat.
+[[models]]
+name = "gpt-5"
+protocols = ["openai-chat", "openai-responses", "anthropic-messages"]
+
+[[models.layers]]
+name = "copilot"
+strategy = "random"
+targets = [
+  { backend = "copilot", credential = "copilot-token", model = "gpt-5" },
 ]
 
 # V4.1 Flash has a distinct Go ID and uses deepseek-flash on the official API.

@@ -288,6 +288,7 @@ error.
 | `kimi-code` | `https://api.kimi.com/coding/v1` | Chat, Anthropic |
 | `kimi-official` | `https://api.moonshot.cn/v1` | Chat |
 | `zhipu-coding-plan` | `https://open.bigmodel.cn/api` | Chat, Responses, Anthropic |
+| `copilot` | `https://api.githubcopilot.com` | Chat |
 
 For `opencode-go`, the adapter contains the official model-to-protocol catalog.
 Declare only the exact model ID and omit `protocols`:
@@ -316,6 +317,53 @@ multimodal context windows; do not substitute the text-only `glm-5.3` model.
 See the [GLM Coding Plan endpoint guide](https://docs.bigmodel.cn/cn/coding-plan/quick-start),
 the [official GLM-5.3-Flash announcement](https://z.ai/blog/glm-5.3-flash), and
 the [OpenCode GLM-5.3-Flash model data](https://opencode.ai/data/zhipu/glm-5-3-flash).
+
+### GitHub Copilot
+
+The `copilot` adapter talks to the Copilot API at
+`https://api.githubcopilot.com` over native OpenAI Chat; Responses and
+Anthropic Messages requests are translated at the protocol boundary.
+
+Obtain the credential token through GitHub's device flow with the login
+helper. It always uses GitHub's own Copilot editor App (`Iv1.b507a08c87ecfe98`),
+because the Copilot API only accepts tokens issued to Apps it recognizes:
+
+```sh
+cargo run --bin quotamux-copilot-login
+# Or inside the container image:
+docker compose run --rm quotamux /quotamux-copilot-login
+```
+
+Open the printed verification URI, enter the user code, and authorize. The
+helper prints the token plus the GitHub login it belongs to; paste the token
+as the `api_key` of the copilot backend credential. The token does not expire
+and QuotaMux never refreshes or persists it anywhere except your
+configuration. If GitHub revokes it, upstream attempts fail with `401`,
+open the authentication circuit, and the operator simply logs in again.
+
+Discover the model IDs enabled on your plan before declaring backend models:
+
+```sh
+curl -H "Authorization: Bearer $TOKEN" https://api.githubcopilot.com/models
+```
+
+```toml
+[[backends]]
+id = "copilot"
+adapter = "copilot"
+
+[[backends.credentials]]
+id = "copilot-token"
+api_key = "github-device-flow-token"
+
+[[backends.models]]
+name = "gpt-5"
+protocols = ["openai-chat"]
+```
+
+Copilot failures use generic HTTP classification. Plan quota pressure
+surfaces as `429` and is treated as capacity pressure, so a busy window
+backs off that one target without affecting other backends.
 
 ### Custom adapters
 
@@ -486,7 +534,7 @@ Adapters classify failures by provider meaning, not by status code alone:
 - GLM Coding Plan uses the official numeric business codes to distinguish
   request errors, rate pressure, subscription quota, billing, and account or
   model configuration failures.
-- Custom adapters use generic HTTP classification only.
+- GitHub Copilot and custom adapters use generic HTTP classification only.
 
 Request-specific `4xx` failures such as `400` and `422` are returned without
 fallback or circuit impact. Provider-side failures open or suspend the exact
