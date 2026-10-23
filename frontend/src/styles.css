@@ -454,17 +454,18 @@ td.numeric { text-align: right; font-variant-numeric: tabular-nums; }
 .cell-main { display: block; color: var(--text); }
 .cell-sub { display: block; color: var(--muted); font-size: 12px; }
 
+/* GitHub sign-in panel: reuse the article panel with the accent callout
+   treatment from .effective, so it reads as a highlighted action. */
 .signin {
-  border: 1px solid #d0d7de;
-  border-radius: 8px;
-  padding: 16px;
-  margin-bottom: 16px;
-  background: #f6f8fa;
+  background: #25302e;
+  border-left: 3px solid var(--accent);
+  margin: 0 0 18px;
 }
+.signin a { color: var(--accent); }
 .device-code {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 28px;
+  font-size: 26px;
   letter-spacing: 3px;
   font-weight: 600;
+  color: var(--accent);
   margin: 8px 0;
 }
