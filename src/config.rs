@@ -941,14 +941,18 @@ data_dir = "data"
 
         assert!(adapter.supports_protocol(Protocol::OpenAiChat));
         assert!(adapter.supports_protocol(Protocol::OpenAiResponses));
-        assert!(!adapter.supports_protocol(Protocol::AnthropicMessages));
+        assert!(adapter.supports_protocol(Protocol::AnthropicMessages));
 
         // Responses-only upstream models translate chat and anthropic ingress.
         config.backends[0].models[0].protocols = vec![Protocol::OpenAiResponses];
         config.validate().unwrap();
 
-        config.backends[0].models[0].protocols = vec![Protocol::AnthropicMessages];
-        assert!(config.validate().is_err());
+        // Claude models serve chat and the native Anthropic endpoint.
+        config.backends[0].models[0].name = "claude-sonnet-5.5".into();
+        config.backends[0].models[0].protocols =
+            vec![Protocol::OpenAiChat, Protocol::AnthropicMessages];
+        config.models[0].layers[0].targets[0].model = "claude-sonnet-5.5".into();
+        config.validate().unwrap();
 
         config.backends[0].models[0].protocols = vec![Protocol::OpenAiChat];
         config.backends[0].endpoint = Some("https://gateway.example/v1/chat/completions".into());

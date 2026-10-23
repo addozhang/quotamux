@@ -321,11 +321,16 @@ the [OpenCode GLM-5.3-Flash model data](https://opencode.ai/data/zhipu/glm-5-3-f
 ### GitHub Copilot
 
 The `github-copilot` adapter talks to `https://api.githubcopilot.com` with
-native Chat and Responses egress. List the model IDs enabled on your plan
-with `curl -H "Authorization: Bearer $TOKEN" https://api.githubcopilot.com/models`;
-newer models such as `gpt-6-sol` only serve the Responses API, so declare
-`protocols = ["openai-responses"]` for them and Chat or Anthropic Messages
-ingress is translated at the protocol boundary.
+native Chat, Responses, and Anthropic Messages egress. List the model IDs
+enabled on your plan with
+`curl -H "Authorization: Bearer $TOKEN" https://api.githubcopilot.com/models`
+and check each model's `supported_endpoints`: newer models such as
+`gpt-6-sol` only serve the Responses API, so declare
+`protocols = ["openai-responses"]` for them; Claude models also serve the
+native Anthropic endpoint and can declare `anthropic-messages` too.
+Undeclared ingress protocols are translated at the protocol boundary.
+GitHub's Anthropic endpoint authenticates with a Bearer token rather than
+`x-api-key`; the adapter applies that automatically.
 
 Get the token once through GitHub's device flow: the **Sign in with GitHub**
 button on a Copilot credential in the Accounts page, or the login helper.
