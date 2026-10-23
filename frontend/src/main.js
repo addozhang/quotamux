@@ -120,8 +120,7 @@ async function startSignin(path, note) {
     state.signin = { path, status: "error", message: String(e?.message || e) };
     render();
   }
-}
-async function pollSignin() {
+}async function pollSignin() {
   const s = state.signin;
   if (!s || s.status !== "pending") return;
   let res;
@@ -142,7 +141,9 @@ async function pollSignin() {
     return;
   }
   if (res.status === "pending") {
-    scheduleSigninPoll(res.interval || 5);
+    // A response interval means GitHub asked us to slow down (RFC 8628 adds
+    // five seconds to the previous interval); plain pending keeps the default.
+    scheduleSigninPoll(res.interval ? res.interval + 5 : 5);
     return;
   }
   if (res.status === "complete") {
