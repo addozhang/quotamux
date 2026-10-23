@@ -19,6 +19,7 @@ RUN mkdir -p /runtime-data
 FROM scratch
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=builder /out/quotamux /quotamux
+COPY --from=builder /out/quotamux-copilot-login /quotamux-copilot-login
 COPY --from=builder --chown=65532:65532 /runtime-data /data
 USER 65532:65532
 EXPOSE 8080

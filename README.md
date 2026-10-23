@@ -331,7 +331,7 @@ because the Copilot API only accepts tokens issued to Apps it recognizes:
 ```sh
 cargo run --bin quotamux-copilot-login
 # Or inside the container image:
-docker compose run --rm quotamux /quotamux-copilot-login
+docker compose run --rm --entrypoint /quotamux-copilot-login quotamux
 ```
 
 Open the printed verification URI, enter the user code, and authorize. The
