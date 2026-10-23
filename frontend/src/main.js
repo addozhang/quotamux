@@ -128,6 +128,7 @@ async function pollSignin() {
   try {
     res = await request("/api/copilot/sign-in/poll", {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ device_code: s.device_code }),
     });
   } catch (e) {
