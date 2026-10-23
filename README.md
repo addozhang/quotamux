@@ -334,6 +334,13 @@ cargo run --bin quotamux-copilot-login
 docker compose run --rm --entrypoint /quotamux-copilot-login quotamux
 ```
 
+The dashboard can trigger the same flow: on the Accounts page, a `copilot`
+credential offers **Sign in with GitHub** while editing. The gateway calls
+GitHub (the browser cannot; GitHub sends no CORS headers), shows the
+verification code, polls until the operator authorizes, and fills the token
+into the credential field. Save then validates and activates it like any
+other configuration change.
+
 Open the printed verification URI, enter the user code, and authorize. The
 helper prints the token plus the GitHub login it belongs to; paste the token
 as the `api_key` of the copilot backend credential. The token does not expire

@@ -44,6 +44,11 @@ name = "gateway_integration"
 path = "tests/gateway_integration.rs"
 required-features = ["test-support"]
 
+[[test]]
+name = "copilot_signin"
+path = "tests/copilot_signin.rs"
+required-features = ["test-support"]
+
 [profile.release]
 codegen-units = 1
 lto = "thin"

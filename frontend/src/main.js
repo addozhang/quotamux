@@ -32,6 +32,7 @@ const state = {
   window: "1d",
   cursor: null,
   cursors: [],
+  signin: null,
   nextCursor: null,
   childGeneration: 0,
   loading: false,
@@ -88,6 +89,52 @@ function refs(path) {
   const t = get(path),
     backend = state.draft.backends.find((b) => b.id === t.backend);
   return `<div class="target-editor">${field(path + ".backend", "Account", "text", ["", ...state.draft.backends.map((b) => b.id)])}${field(path + ".credential", "Credential", "text", ["", ...(backend?.credentials || []).map((c) => c.id)])}${field(path + ".model", "Upstream model", "text", ["", ...(backend?.models || []).map((m) => m.name)])}${button("remove", "Remove target", path)}</div>`;
+}
+let signinTimer = 0;
+function scheduleSigninPoll(seconds) {
+  clearTimeout(signinTimer);
+  signinTimer = setTimeout(pollSignin, Math.max(1, seconds) * 1000);
+}
+async function pollSignin() {
+  const s = state.signin;
+  if (!s || s.status !== "pending") return;
+  let res;
+  try {
+    res = await request("/api/copilot/sign-in/poll", {
+      method: "POST",
+      body: JSON.stringify({ device_code: s.device_code }),
+    });
+  } catch (e) {
+    state.signin = { ...s, status: "error", message: String(e?.message || e) };
+    render();
+    return;
+  }
+  if (res.status === "pending") {
+    scheduleSigninPoll(res.interval || 5);
+    return;
+  }
+  if (res.status === "complete") {
+    state.signin = null;
+    if (get(s.path)) {
+      set(`${s.path}.api_key`, res.token);
+      state.message = `Signed in${res.login ? ` as ${res.login}` : ""}. Save to activate.`;
+    } else {
+      state.message = "Signed in, but the credential was removed before the token arrived.";
+    }
+    render();
+    return;
+  }
+  state.signin = { ...s, status: res.status };
+  render();
+}
+function copilotPanel() {
+  const s = state.signin;
+  if (!s) return "";
+  if (s.status === "expired" || s.status === "denied")
+    return `<article class="signin"><h3>GitHub sign-in</h3><p class="muted">${s.status === "expired" ? "The device code expired." : "The authorization request was denied."}</p>${button("copilot-signin", "Try again", s.path)}</article>`;
+  if (s.status === "error")
+    return `<article class="signin"><h3>GitHub sign-in</h3><p class="muted">${esc(s.message || "GitHub could not be reached.")}</p>${button("copilot-signin", "Try again", s.path)}</article>`;
+  return `<article class="signin"><h3>GitHub sign-in</h3><p>Open <a href="${esc(s.verification_uri)}" target="_blank" rel="noreferrer">${esc(s.verification_uri)}</a> and enter this code:</p><p class="device-code">${esc(s.user_code)}</p><p class="muted">Waiting for authorization…</p>${button("copilot-signin-cancel", "Cancel")}</article>`;
 }
 function render() {
   if (!state.draft) {
@@ -167,14 +214,14 @@ function accounts() {
   const index = Number(state.accountTab?.split(":")[1]);
   const backend = state.draft.backends[index];
   const panel = backend ? (state.editing ? accountEditor(backend, index) : accountSummary(backend)) : '<p class="muted">No accounts configured.</p>';
-  return `<main class="accounts-page" aria-label="Accounts"><div class="heading"><h1>Accounts</h1>${state.editing ? button("add-backend", "+ Add account") : ""}</div><nav class="account-tabs" role="tablist" aria-label="Account settings">${tabs.map(([id, label]) => button("account-tab", label, id, `role="tab" id="account-tab-${id}" aria-controls="account-panel" aria-selected="${state.accountTab === id}"`)).join("")}</nav><div role="tabpanel" id="account-panel" ${state.accountTab ? `aria-labelledby="account-tab-${state.accountTab}"` : 'aria-label="Accounts"'}>${panel}</div></main>`;
+  return `<main class="accounts-page" aria-label="Accounts"><div class="heading"><h1>Accounts</h1>${state.editing ? button("add-backend", "+ Add account") : ""}</div>${copilotPanel()}<nav class="account-tabs" role="tablist" aria-label="Account settings">${tabs.map(([id, label]) => button("account-tab", label, id, `role="tab" id="account-tab-${id}" aria-controls="account-panel" aria-selected="${state.accountTab === id}"`)).join("")}</nav><div role="tabpanel" id="account-panel" ${state.accountTab ? `aria-labelledby="account-tab-${state.accountTab}"` : 'aria-label="Accounts"'}>${panel}</div></main>`;
 }
 function accountEditor(b, i) {
       const p = `backends.${i}`;
       return `<p class="muted">Credentials stay blank when loaded. Leave an existing key blank to preserve it.</p><article><div class="heading"><h3 data-account-heading>${esc(displayName(b.id || "New account"))}</h3>${button("remove", "Delete account", p)}</div><div class="row">${field(p + ".id", "Account ID")}${field(p + ".adapter", "Adapter", "text", adapters)}</div>${b.adapter.startsWith("custom-") ? field(p + ".endpoint", "Endpoint URL (blank preserves existing)") : '<p class="muted">Official endpoint managed by adapter</p>'}<h4>Credentials</h4>${b.credentials
         .map((c, j) => {
           const q = `${p}.credentials.${j}`;
-          return `<div class="credential"><div class="row">${field(q + ".id", "Credential ID")}${field(q + ".api_key", "API key (blank preserves existing)", "password")}${field(q + ".pool", "Shared pool", "text", ["", ...(state.draft.capacity_pools || []).map((p) => p.id)])}</div>${!c.pool ? button("add-pool", "Create capacity pool", q) : ""}${button("remove", "Delete credential", q)}</div>`;
+          return `<div class="credential"><div class="row">${field(q + ".id", "Credential ID")}${field(q + ".api_key", "API key (blank preserves existing)", "password")}${field(q + ".pool", "Shared pool", "text", ["", ...(state.draft.capacity_pools || []).map((p) => p.id)])}</div>${!c.pool ? button("add-pool", "Create capacity pool", q) : ""}${b.adapter === "copilot" ? button("copilot-signin", "Sign in with GitHub", q) : ""}${button("remove", "Delete credential", q)}</div>`;
         })
         .join(
           "",
@@ -861,11 +908,30 @@ app.addEventListener("click", async (event) => {
       return;
     }
     if (a === "disable-edit") {
+      clearTimeout(signinTimer);
+      state.signin = null;
       if (state.dirty) {
         if (!confirm("Discard unsaved changes and disable editing?")) return;
         adopt(await request("/api/routing"));
       }
       state.editing = false;
+      render();
+      return;
+    }
+    if (a === "copilot-signin") {
+      try {
+        const res = await request("/api/copilot/sign-in", { method: "POST" });
+        state.signin = { path: p, status: "pending", ...res };
+      } catch (e) {
+        state.signin = { path: p, status: "error", message: String(e?.message || e) };
+      }
+      render();
+      scheduleSigninPoll(state.signin?.interval || 5);
+      return;
+    }
+    if (a === "copilot-signin-cancel") {
+      clearTimeout(signinTimer);
+      state.signin = null;
       render();
       return;
     }

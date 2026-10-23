@@ -453,3 +453,18 @@ th.numeric,
 td.numeric { text-align: right; font-variant-numeric: tabular-nums; }
 .cell-main { display: block; color: var(--text); }
 .cell-sub { display: block; color: var(--muted); font-size: 12px; }
+
+.signin {
+  border: 1px solid #d0d7de;
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 16px;
+  background: #f6f8fa;
+}
+.device-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 28px;
+  letter-spacing: 3px;
+  font-weight: 600;
+  margin: 8px 0;
+}

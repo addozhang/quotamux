@@ -1,11 +1,16 @@
 //! One routing document, one active request runtime, one save transaction.
-use crate::{AppState, Config, build_app, provider::BackendClient, types::Protocol};
+use crate::{
+    AppState, Config, build_app,
+    copilot_login::{self, DeviceEndpoints, PollOutcome},
+    provider::BackendClient,
+    types::Protocol,
+};
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Query, Request, State, rejection::JsonRejection},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -15,6 +20,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
+    time::Duration,
 };
 use tokio::sync::Mutex;
 use tower::ServiceExt;
@@ -106,6 +112,8 @@ impl Workspace {
     pub fn router(self: &Arc<Self>) -> Router {
         Router::new()
             .route("/api/routing", get(read).put(save))
+            .route("/api/copilot/sign-in", post(copilot_sign_in))
+            .route("/api/copilot/sign-in/poll", post(copilot_sign_in_poll))
             .layer(DefaultBodyLimit::max(1024 * 1024))
             .fallback(dispatch)
             .with_state(self.clone())
@@ -406,28 +414,8 @@ async fn save(
     headers: HeaderMap,
     input: Result<Json<Save>, JsonRejection>,
 ) -> Response {
-    if let Some(origin) = headers.get(header::ORIGIN) {
-        let trusted = origin
-            .to_str()
-            .ok()
-            .and_then(|o| reqwest::Url::parse(o).ok())
-            .is_some_and(|url| {
-                let prefix = format!("{}://", url.scheme());
-                let authority = url
-                    .as_str()
-                    .strip_prefix(&prefix)
-                    .unwrap_or_default()
-                    .trim_end_matches('/');
-                headers.get(header::HOST).and_then(|h| h.to_str().ok()) == Some(authority)
-                    && matches!(url.scheme(), "http" | "https")
-            });
-        if !trusted {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({"error":"Foreign browser origin rejected."})),
-            )
-                .into_response();
-        }
+    if let Some(response) = reject_foreign_origin(&headers) {
+        return response;
     }
     let Ok(Json(input)) = input else {
         return invalid("Invalid routing document.").into_response();
@@ -435,6 +423,141 @@ async fn save(
     match workspace.commit(input).await {
         Ok(revision) => Json(workspace.view(revision, Utc::now()).await).into_response(),
         Err(error) => error.into_response(),
+    }
+}
+
+/// Browser-originated writes must come from this dashboard. Non-browser
+/// callers, which send no `Origin`, are subject to the deployment's own
+/// network controls like every other API route.
+fn reject_foreign_origin(headers: &HeaderMap) -> Option<Response> {
+    let origin = headers.get(header::ORIGIN)?;
+    let trusted = origin
+        .to_str()
+        .ok()
+        .and_then(|o| reqwest::Url::parse(o).ok())
+        .is_some_and(|url| {
+            let prefix = format!("{}://", url.scheme());
+            let authority = url
+                .as_str()
+                .strip_prefix(&prefix)
+                .unwrap_or_default()
+                .trim_end_matches('/');
+            headers.get(header::HOST).and_then(|h| h.to_str().ok()) == Some(authority)
+                && matches!(url.scheme(), "http" | "https")
+        });
+    if trusted {
+        return None;
+    }
+    Some(
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error":"Foreign browser origin rejected."})),
+        )
+            .into_response(),
+    )
+}
+
+/// The GitHub endpoints the sign-in routes talk to. Tests point them at a
+/// fake GitHub through these test-support environment variables.
+fn copilot_endpoints() -> DeviceEndpoints {
+    #[cfg(feature = "test-support")]
+    if let (Ok(device_code_url), Ok(token_url), Ok(user_url)) = (
+        std::env::var("QUOTAMUX_TEST_DEVICE_CODE_URL"),
+        std::env::var("QUOTAMUX_TEST_TOKEN_URL"),
+        std::env::var("QUOTAMUX_TEST_USER_URL"),
+    ) {
+        return DeviceEndpoints {
+            device_code_url,
+            token_url,
+            user_url,
+        };
+    }
+    DeviceEndpoints::default()
+}
+
+fn github_client() -> Option<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .ok()
+}
+
+/// Start GitHub's device flow for a Copilot credential. The browser cannot
+/// run it directly because GitHub sends no CORS headers, so the gateway calls
+/// GitHub and hands back what the operator needs to finish on github.com.
+async fn copilot_sign_in(headers: HeaderMap) -> Response {
+    if let Some(response) = reject_foreign_origin(&headers) {
+        return response;
+    }
+    let Some(client) = github_client() else {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error":"Unable to build the GitHub client."})),
+        )
+            .into_response();
+    };
+    match copilot_login::request_device_code(&client, &copilot_endpoints()).await {
+        Ok(code) => Json(json!({
+            "device_code": code.device_code,
+            "user_code": code.user_code,
+            "verification_uri": code.verification_uri,
+            "expires_in": code.expires_in,
+            "interval": code.interval,
+        }))
+        .into_response(),
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignInPoll {
+    device_code: String,
+}
+
+/// Check once whether the operator finished authorizing on github.com. The
+/// dashboard polls this on the interval GitHub asked for.
+async fn copilot_sign_in_poll(
+    headers: HeaderMap,
+    input: Result<Json<SignInPoll>, JsonRejection>,
+) -> Response {
+    if let Some(response) = reject_foreign_origin(&headers) {
+        return response;
+    }
+    let Ok(Json(input)) = input else {
+        return invalid("A device_code is required.").into_response();
+    };
+    if input.device_code.trim().is_empty() {
+        return invalid("A device_code is required.").into_response();
+    }
+    let Some(client) = github_client() else {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error":"Unable to build the GitHub client."})),
+        )
+            .into_response();
+    };
+    let endpoints = copilot_endpoints();
+    match copilot_login::poll_token(&client, &endpoints, &input.device_code).await {
+        Ok(PollOutcome::Pending) => Json(json!({"status":"pending"})).into_response(),
+        Ok(PollOutcome::SlowDown { interval_secs }) => {
+            Json(json!({"status":"pending","interval":interval_secs})).into_response()
+        }
+        Ok(PollOutcome::Expired) => Json(json!({"status":"expired"})).into_response(),
+        Ok(PollOutcome::Denied) => Json(json!({"status":"denied"})).into_response(),
+        Ok(PollOutcome::Complete { access_token }) => {
+            let login = copilot_login::github_login(&client, &endpoints, &access_token).await;
+            Json(json!({"status":"complete","token":access_token,"login":login})).into_response()
+        }
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": error.to_string()})),
+        )
+            .into_response(),
     }
 }
 
