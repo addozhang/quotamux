@@ -940,10 +940,14 @@ data_dir = "data"
         config.validate().unwrap();
 
         assert!(adapter.supports_protocol(Protocol::OpenAiChat));
-        assert!(!adapter.supports_protocol(Protocol::OpenAiResponses));
+        assert!(adapter.supports_protocol(Protocol::OpenAiResponses));
         assert!(!adapter.supports_protocol(Protocol::AnthropicMessages));
 
+        // Responses-only upstream models translate chat and anthropic ingress.
         config.backends[0].models[0].protocols = vec![Protocol::OpenAiResponses];
+        config.validate().unwrap();
+
+        config.backends[0].models[0].protocols = vec![Protocol::AnthropicMessages];
         assert!(config.validate().is_err());
 
         config.backends[0].models[0].protocols = vec![Protocol::OpenAiChat];

@@ -288,7 +288,7 @@ error.
 | `kimi-code` | `https://api.kimi.com/coding/v1` | Chat, Anthropic |
 | `kimi-official` | `https://api.moonshot.cn/v1` | Chat |
 | `zhipu-coding-plan` | `https://open.bigmodel.cn/api` | Chat, Responses, Anthropic |
-| `copilot` | `https://api.githubcopilot.com` | Chat |
+| `copilot` | `https://api.githubcopilot.com` | Chat, Responses |
 
 For `opencode-go`, the adapter contains the official model-to-protocol catalog.
 Declare only the exact model ID and omit `protocols`:
@@ -321,8 +321,11 @@ the [OpenCode GLM-5.3-Flash model data](https://opencode.ai/data/zhipu/glm-5-3-f
 ### GitHub Copilot
 
 The `copilot` adapter talks to the Copilot API at
-`https://api.githubcopilot.com` over native OpenAI Chat; Responses and
-Anthropic Messages requests are translated at the protocol boundary.
+`https://api.githubcopilot.com` over native OpenAI Chat and OpenAI Responses.
+Some Copilot models are only accessible through the Responses API
+(`unsupported_api_for_model` on `/chat/completions`); declare
+`protocols = ["openai-responses"]` for those so Chat and Anthropic Messages
+requests are translated at the protocol boundary.
 
 Obtain the credential token through GitHub's device flow with the login
 helper. It always uses GitHub's own Copilot editor App (`Iv1.b507a08c87ecfe98`),
@@ -364,8 +367,12 @@ id = "copilot-token"
 api_key = "github-device-flow-token"
 
 [[backends.models]]
-name = "gpt-5"
-protocols = ["openai-chat"]
+# Chat-native model:
+# name = "claude-sonnet-5.5"
+# protocols = ["openai-chat"]
+# Responses-only model:
+name = "gpt-6-sol"
+protocols = ["openai-responses"]
 ```
 
 Copilot failures use generic HTTP classification. Plan quota pressure

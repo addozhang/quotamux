@@ -18,7 +18,7 @@ impl ProviderAdapter for Copilot {
     }
 
     fn supports_protocol(&self, protocol: Protocol) -> bool {
-        protocol == Protocol::OpenAiChat
+        matches!(protocol, Protocol::OpenAiChat | Protocol::OpenAiResponses)
     }
 
     fn build_url(&self, endpoint: &str, protocol: Protocol) -> String {
