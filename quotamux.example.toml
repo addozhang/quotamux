@@ -199,8 +199,11 @@ api_key = ""
 #   curl -H "Authorization: Bearer $TOKEN" https://api.githubcopilot.com/models
 # gpt-6-sol and other newer models only serve the Responses API; declare
 # openai-responses alone so Chat and Anthropic ingress is translated.
+# default_thinking_level (off/low/medium/high/xhigh/max) applies when the
+# request carries no reasoning parameter.
 name = "gpt-6-sol"
 protocols = ["openai-responses"]
+default_thinking_level = "medium"
 
 [[backends]]
 id = "deepseek"

@@ -218,6 +218,8 @@ impl AppState {
                                                         m.pricing == model.pricing
                                                             && m.pricing_schedule
                                                                 == model.pricing_schedule
+                                                            && m.default_thinking_level
+                                                                == model.default_thinking_level
                                                     })
                                         })
                                 })
@@ -1099,7 +1101,7 @@ async fn execute_json_attempt(
     let started_at_ms = Utc::now().timestamp_millis();
     let started = Instant::now();
     let provider_protocol = runtime.client.protocol_for(ingress);
-    let (egress, translated, prepared) =
+    let (egress, translated, mut prepared) =
         match prepare_for_provider(provider_protocol, ingress, original, runtime.client.model()) {
             Ok(value) => value,
             Err(error) => {
@@ -1113,6 +1115,12 @@ async fn execute_json_attempt(
                 });
             }
         };
+    if let (Some(style), Some(level)) = (
+        runtime.client.thinking_style(),
+        runtime.client.thinking_default(),
+    ) {
+        apply_default_thinking(&mut prepared, egress, style, level);
+    }
     let request_bytes = serde_json::to_vec(&prepared)
         .map(|v| v.len() as u64)
         .unwrap_or(0);
@@ -1779,7 +1787,7 @@ async fn prepare_stream_attempt(
     let attempt_started_at_ms = Utc::now().timestamp_millis();
     let attempt_started = Instant::now();
     let provider_protocol = runtime.client.protocol_for(ingress);
-    let (egress, translated, prepared) =
+    let (egress, translated, mut prepared) =
         match prepare_for_provider(provider_protocol, ingress, original, runtime.client.model()) {
             Ok(value) => value,
             Err(error) => {
@@ -1793,6 +1801,12 @@ async fn prepare_stream_attempt(
                 });
             }
         };
+    if let (Some(style), Some(level)) = (
+        runtime.client.thinking_style(),
+        runtime.client.thinking_default(),
+    ) {
+        apply_default_thinking(&mut prepared, egress, style, level);
+    }
     let request_bytes = serde_json::to_vec(&prepared)
         .map(|v| v.len() as u64)
         .unwrap_or(0);
@@ -1983,6 +1997,84 @@ fn stream_error_class(
             })
             .unwrap_or(FailureClass::StreamFailure),
     )
+}
+
+/// Apply a backend model's default thinking level to the prepared upstream
+/// body when the request carries no reasoning/thinking parameter. Explicit
+/// client preferences always win, and adapters without a known dialect for
+/// the egress protocol are left untouched.
+fn apply_default_thinking(
+    prepared: &mut Value,
+    egress: Protocol,
+    style: crate::provider::adapters::ThinkingStyle,
+    level: crate::config::ThinkingLevel,
+) {
+    use crate::config::ThinkingLevel;
+    use crate::provider::adapters::ThinkingStyle;
+    let Some(body) = prepared.as_object_mut() else {
+        return;
+    };
+    match (egress, style) {
+        (Protocol::OpenAiChat, ThinkingStyle::EffortLevels) => {
+            if body.get("reasoning_effort").is_some() || body.get("thinking").is_some() {
+                return;
+            }
+            body.insert(
+                "reasoning_effort".into(),
+                Value::String(level.effort_str().into()),
+            );
+        }
+        (Protocol::OpenAiChat, ThinkingStyle::ThinkingToggle) => {
+            if body.get("reasoning_effort").is_some() || body.get("thinking").is_some() {
+                return;
+            }
+            let kind = if level == ThinkingLevel::Off {
+                "disabled"
+            } else {
+                "enabled"
+            };
+            body.insert("thinking".into(), json!({ "type": kind }));
+        }
+        (Protocol::OpenAiResponses, ThinkingStyle::EffortLevels) => {
+            if body.get("reasoning").is_some() {
+                return;
+            }
+            body.insert("reasoning".into(), json!({ "effort": level.effort_str() }));
+        }
+        // No known responses dialect spells a thinking toggle.
+        (Protocol::OpenAiResponses, ThinkingStyle::ThinkingToggle) => {}
+        (Protocol::AnthropicMessages, ThinkingStyle::EffortLevels) => {
+            if body.get("thinking").is_some() {
+                return;
+            }
+            if level == ThinkingLevel::Off {
+                body.insert("thinking".into(), json!({ "type": "disabled" }));
+                return;
+            }
+            match body.get_mut("output_config").and_then(Value::as_object_mut) {
+                Some(config) => {
+                    config.insert("effort".into(), json!(level.effort_str()));
+                }
+                None => {
+                    body.insert(
+                        "output_config".into(),
+                        json!({ "effort": level.effort_str() }),
+                    );
+                }
+            }
+        }
+        (Protocol::AnthropicMessages, ThinkingStyle::ThinkingToggle) => {
+            if body.get("thinking").is_some() {
+                return;
+            }
+            let kind = if level == ThinkingLevel::Off {
+                "disabled"
+            } else {
+                "enabled"
+            };
+            body.insert("thinking".into(), json!({ "type": kind }));
+        }
+    }
 }
 
 fn prepare_for_provider(
@@ -2843,6 +2935,143 @@ fn attempt_rollup_json(value: AttemptRollup) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ThinkingLevel;
+    use crate::provider::adapters::ThinkingStyle;
+
+    #[test]
+    fn default_thinking_injects_effort_for_level_adapters() {
+        let mut body = json!({"model":"gpt-6-astra","input":"hi"});
+        apply_default_thinking(
+            &mut body,
+            Protocol::OpenAiResponses,
+            ThinkingStyle::EffortLevels,
+            ThinkingLevel::Medium,
+        );
+        assert_eq!(body["reasoning"]["effort"], "medium");
+
+        let mut body = json!({"model":"m","messages":[]});
+        apply_default_thinking(
+            &mut body,
+            Protocol::OpenAiChat,
+            ThinkingStyle::EffortLevels,
+            ThinkingLevel::Max,
+        );
+        assert_eq!(body["reasoning_effort"], "max");
+
+        let mut body = json!({"model":"m","messages":[]});
+        apply_default_thinking(
+            &mut body,
+            Protocol::OpenAiChat,
+            ThinkingStyle::EffortLevels,
+            ThinkingLevel::Off,
+        );
+        assert_eq!(body["reasoning_effort"], "none");
+    }
+
+    #[test]
+    fn default_thinking_injects_toggle_for_toggle_adapters() {
+        let mut body = json!({"model":"glm-5.3","messages":[]});
+        apply_default_thinking(
+            &mut body,
+            Protocol::OpenAiChat,
+            ThinkingStyle::ThinkingToggle,
+            ThinkingLevel::Medium,
+        );
+        assert_eq!(body["thinking"]["type"], "enabled");
+
+        let mut body = json!({"model":"glm-5.3","messages":[]});
+        apply_default_thinking(
+            &mut body,
+            Protocol::OpenAiChat,
+            ThinkingStyle::ThinkingToggle,
+            ThinkingLevel::Off,
+        );
+        assert_eq!(body["thinking"]["type"], "disabled");
+
+        // No known responses dialect for toggles: body untouched.
+        let mut body = json!({"model":"glm-5.3","input":"hi"});
+        apply_default_thinking(
+            &mut body,
+            Protocol::OpenAiResponses,
+            ThinkingStyle::ThinkingToggle,
+            ThinkingLevel::High,
+        );
+        assert!(body.get("thinking").is_none() && body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn default_thinking_maps_levels_onto_anthropic_egress() {
+        let mut body = json!({"model":"claude-sonnet-5.5","messages":[]});
+        apply_default_thinking(
+            &mut body,
+            Protocol::AnthropicMessages,
+            ThinkingStyle::EffortLevels,
+            ThinkingLevel::High,
+        );
+        assert_eq!(body["output_config"]["effort"], "high");
+
+        // An existing output_config (e.g. a projected format) keeps its keys.
+        let mut body =
+            json!({"model":"m","messages":[],"output_config":{"format":{"type":"json_object"}}});
+        apply_default_thinking(
+            &mut body,
+            Protocol::AnthropicMessages,
+            ThinkingStyle::EffortLevels,
+            ThinkingLevel::Medium,
+        );
+        assert_eq!(body["output_config"]["effort"], "medium");
+        assert_eq!(body["output_config"]["format"]["type"], "json_object");
+
+        let mut body = json!({"model":"m","messages":[]});
+        apply_default_thinking(
+            &mut body,
+            Protocol::AnthropicMessages,
+            ThinkingStyle::EffortLevels,
+            ThinkingLevel::Off,
+        );
+        assert_eq!(body["thinking"]["type"], "disabled");
+
+        let mut body =
+            json!({"model":"m","messages":[],"thinking":{"type":"enabled","budget_tokens":1024}});
+        apply_default_thinking(
+            &mut body,
+            Protocol::AnthropicMessages,
+            ThinkingStyle::EffortLevels,
+            ThinkingLevel::High,
+        );
+        assert_eq!(body["thinking"]["budget_tokens"], 1024);
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn default_thinking_never_overrides_explicit_client_preferences() {
+        let mut body = json!({"model":"m","messages":[],"reasoning_effort":"low"});
+        apply_default_thinking(
+            &mut body,
+            Protocol::OpenAiChat,
+            ThinkingStyle::EffortLevels,
+            ThinkingLevel::Max,
+        );
+        assert_eq!(body["reasoning_effort"], "low");
+
+        let mut body = json!({"model":"m","messages":[],"thinking":{"type":"disabled"}});
+        apply_default_thinking(
+            &mut body,
+            Protocol::OpenAiChat,
+            ThinkingStyle::ThinkingToggle,
+            ThinkingLevel::High,
+        );
+        assert_eq!(body["thinking"]["type"], "disabled");
+
+        let mut body = json!({"model":"m","input":"hi","reasoning":{"effort":"low"}});
+        apply_default_thinking(
+            &mut body,
+            Protocol::OpenAiResponses,
+            ThinkingStyle::EffortLevels,
+            ThinkingLevel::Max,
+        );
+        assert_eq!(body["reasoning"]["effort"], "low");
+    }
 
     #[test]
     fn client_error_bodies_carry_the_upstream_discriminator() {

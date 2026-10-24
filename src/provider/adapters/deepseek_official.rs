@@ -2,7 +2,9 @@ use reqwest::{RequestBuilder, header::HeaderMap};
 
 use crate::{config::AdapterKind, types::Protocol};
 
-use super::{EndpointPolicy, ProviderAdapter, anthropic_auth, bearer_auth, standard_url};
+use super::{
+    EndpointPolicy, ProviderAdapter, ThinkingStyle, anthropic_auth, bearer_auth, standard_url,
+};
 
 pub(super) static DEEPSEEK_OFFICIAL: DeepSeekOfficial = DeepSeekOfficial;
 
@@ -11,6 +13,10 @@ pub(super) struct DeepSeekOfficial;
 impl ProviderAdapter for DeepSeekOfficial {
     fn kind(&self) -> AdapterKind {
         AdapterKind::DeepSeekOfficial
+    }
+
+    fn default_thinking_style(&self) -> Option<ThinkingStyle> {
+        Some(ThinkingStyle::ThinkingToggle)
     }
 
     fn endpoint_policy(&self) -> EndpointPolicy {

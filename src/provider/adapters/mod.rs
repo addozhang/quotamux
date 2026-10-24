@@ -28,10 +28,25 @@ pub enum ModelProtocolPolicy {
     OfficialCatalog,
 }
 
+/// How an upstream expects a thinking preference to be spelled.
+pub enum ThinkingStyle {
+    /// `reasoning_effort` (chat), `reasoning.effort` (responses),
+    /// `output_config.effort` (anthropic).
+    EffortLevels,
+    /// `thinking: {"type": "enabled" | "disabled"}` on chat.
+    ThinkingToggle,
+}
+
 pub trait ProviderAdapter: Send + Sync {
     fn kind(&self) -> AdapterKind;
     fn endpoint_policy(&self) -> EndpointPolicy;
     fn supports_protocol(&self, protocol: Protocol) -> bool;
+
+    /// The dialect a `default_thinking_level` is written in, or `None` when
+    /// the adapter has no known thinking parameter.
+    fn default_thinking_style(&self) -> Option<ThinkingStyle> {
+        None
+    }
 
     fn model_protocol_policy(&self) -> ModelProtocolPolicy {
         ModelProtocolPolicy::Listed

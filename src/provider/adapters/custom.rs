@@ -2,7 +2,7 @@ use reqwest::{RequestBuilder, header::HeaderMap};
 
 use crate::{config::AdapterKind, types::Protocol};
 
-use super::{EndpointPolicy, ProviderAdapter, anthropic_auth, bearer_auth};
+use super::{EndpointPolicy, ProviderAdapter, ThinkingStyle, anthropic_auth, bearer_auth};
 
 pub(super) static CUSTOM_CHAT_COMPLETIONS: Custom = Custom {
     kind: AdapterKind::CustomChatCompletions,
@@ -25,6 +25,10 @@ pub(super) struct Custom {
 impl ProviderAdapter for Custom {
     fn kind(&self) -> AdapterKind {
         self.kind
+    }
+
+    fn default_thinking_style(&self) -> Option<ThinkingStyle> {
+        Some(ThinkingStyle::EffortLevels)
     }
 
     fn endpoint_policy(&self) -> EndpointPolicy {

@@ -2,7 +2,7 @@ use reqwest::{RequestBuilder, header::HeaderMap};
 
 use crate::{config::AdapterKind, types::Protocol};
 
-use super::{EndpointPolicy, ProviderAdapter, bearer_auth, standard_url};
+use super::{EndpointPolicy, ProviderAdapter, ThinkingStyle, bearer_auth, standard_url};
 
 pub(super) static COPILOT: Copilot = Copilot;
 
@@ -11,6 +11,10 @@ pub(super) struct Copilot;
 impl ProviderAdapter for Copilot {
     fn kind(&self) -> AdapterKind {
         AdapterKind::Copilot
+    }
+
+    fn default_thinking_style(&self) -> Option<ThinkingStyle> {
+        Some(ThinkingStyle::EffortLevels)
     }
 
     fn endpoint_policy(&self) -> EndpointPolicy {

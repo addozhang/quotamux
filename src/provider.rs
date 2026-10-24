@@ -15,7 +15,7 @@ use crate::{
     types::{FailureClass, Protocol},
 };
 
-mod adapters;
+pub(crate) mod adapters;
 
 use adapters::ProviderAdapter;
 pub(crate) use adapters::{EndpointPolicy, ModelProtocolPolicy, adapter_for};
@@ -45,6 +45,7 @@ pub struct BackendClient {
     api_key: String,
     model: String,
     protocols: Vec<Protocol>,
+    thinking_default: Option<crate::config::ThinkingLevel>,
     pricing: Option<ModelPricingConfig>,
     tariff: crate::pricing::Tariff,
     client: reqwest::Client,
@@ -228,6 +229,7 @@ impl BackendClient {
             api_key: credential.api_key.clone(),
             model: model.name.clone(),
             protocols,
+            thinking_default: model.default_thinking_level,
             pricing: model.pricing,
             tariff: crate::pricing::Tariff::new(model)
                 .map_err(|_| BackendBuildError::InvalidPricing(backend.id.clone()))?,
@@ -247,6 +249,12 @@ impl BackendClient {
     }
     pub fn model(&self) -> &str {
         &self.model
+    }
+    pub const fn thinking_default(&self) -> Option<crate::config::ThinkingLevel> {
+        self.thinking_default
+    }
+    pub fn thinking_style(&self) -> Option<crate::provider::adapters::ThinkingStyle> {
+        self.adapter.default_thinking_style()
     }
     pub fn endpoint(&self) -> &str {
         &self.endpoint

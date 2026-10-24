@@ -5,7 +5,7 @@ use crate::{
     types::{FailureClass, Protocol},
 };
 
-use super::{EndpointPolicy, ProviderAdapter, anthropic_auth, bearer_auth};
+use super::{EndpointPolicy, ProviderAdapter, ThinkingStyle, anthropic_auth, bearer_auth};
 use crate::provider::ErrorDetails;
 
 pub(super) static ZHIPU_CODING_PLAN: ZhipuCodingPlan = ZhipuCodingPlan;
@@ -15,6 +15,10 @@ pub(super) struct ZhipuCodingPlan;
 impl ProviderAdapter for ZhipuCodingPlan {
     fn kind(&self) -> AdapterKind {
         AdapterKind::ZhipuCodingPlan
+    }
+
+    fn default_thinking_style(&self) -> Option<ThinkingStyle> {
+        Some(ThinkingStyle::ThinkingToggle)
     }
 
     fn endpoint_policy(&self) -> EndpointPolicy {

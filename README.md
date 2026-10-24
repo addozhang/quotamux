@@ -227,6 +227,28 @@ fixed per-model request limits:
 The exact model endpoint, prices, and estimates are maintained in the
 [OpenCode Go documentation](https://opencode.ai/docs/go/).
 
+## Default thinking level
+
+Backend models accept an optional `default_thinking_level`
+(`off`, `low`, `medium`, `high`, `xhigh`, `max`). When a request carries no
+reasoning or thinking parameter of its own, QuotaMux applies the default at
+egress in the upstream's native dialect:
+
+- `github-copilot`, `custom-*`: `reasoning_effort` (chat), `reasoning.effort`
+  (responses), `output_config.effort` (anthropic); `off` disables thinking.
+- `zhipu-coding-plan`, `deepseek-official`: `thinking: {"type": "enabled" |
+  "disabled"}` on chat and anthropic egress.
+
+Adapters without a known thinking dialect (kimi, aliyun, ollama, opencode)
+ignore the field. Explicit client parameters always win.
+
+```toml
+[[backends.models]]
+name = "claude-sonnet-5.5"
+protocols = ["openai-chat", "anthropic-messages"]
+default_thinking_level = "medium"
+```
+
 ## DeepSeek V4.1 Flash
 
 QuotaMux supplies Go's required `x-opencode-session` header automatically.

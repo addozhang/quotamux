@@ -201,6 +201,11 @@ pub struct BackendModelConfig {
     pub name: String,
     #[serde(default)]
     pub protocols: Vec<Protocol>,
+    /// Default thinking level applied at egress when the request carries no
+    /// reasoning/thinking parameter. The adapter translates it into the
+    /// provider's native dialect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_thinking_level: Option<ThinkingLevel>,
     #[serde(default)]
     pub pricing: Option<ModelPricingConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -209,6 +214,38 @@ pub struct BackendModelConfig {
     pub pricing_note: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing_source: Option<String>,
+}
+
+/// Operator-facing thinking vocabulary. `Off` serializes as `off` and maps to
+/// the effort string `none` on level-based providers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub enum ThinkingLevel {
+    #[serde(rename = "off")]
+    Off,
+    #[serde(rename = "low")]
+    Low,
+    #[serde(rename = "medium")]
+    Medium,
+    #[serde(rename = "high")]
+    High,
+    #[serde(rename = "xhigh")]
+    Xhigh,
+    #[serde(rename = "max")]
+    Max,
+}
+
+impl ThinkingLevel {
+    /// The `reasoning_effort` spelling; `off` becomes OpenAI's `none`.
+    pub const fn effort_str(self) -> &'static str {
+        match self {
+            Self::Off => "none",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
