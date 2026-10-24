@@ -134,7 +134,9 @@ pub enum AdapterKind {
     OpenCodeGo,
     #[serde(rename = "zhipu-coding-plan")]
     ZhipuCodingPlan,
-    #[serde(rename = "github-copilot")]
+    /// Reads records written before the rename; new records serialize as
+    /// `github-copilot`.
+    #[serde(rename = "github-copilot", alias = "copilot")]
     Copilot,
     #[serde(rename = "custom-chat-completions")]
     CustomChatCompletions,
@@ -1154,6 +1156,20 @@ data_dir = "data"
         .unwrap_err()
         .to_string();
         assert!(document_error.contains("unknown field `providers`"));
+    }
+
+    #[test]
+    fn adapter_kind_reads_the_pre_rename_copilot_spelling() {
+        // Attempt records written before the rename deserialize from
+        // "copilot" and re-serialize as "github-copilot".
+        let legacy: AdapterKind = serde_json::from_str("\"copilot\"").unwrap();
+        assert!(matches!(legacy, AdapterKind::Copilot));
+        assert_eq!(
+            serde_json::to_string(&legacy).unwrap(),
+            "\"github-copilot\""
+        );
+        let current: AdapterKind = serde_json::from_str("\"github-copilot\"").unwrap();
+        assert_eq!(legacy, current);
     }
 
     #[test]
