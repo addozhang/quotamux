@@ -67,16 +67,36 @@ impl ProviderAdapter for Copilot {
         protocol: Protocol,
         inbound_headers: &HeaderMap,
     ) -> RequestBuilder {
+        // Editor identification. GitHub's edge applies risk heuristics to
+        // bearer-only API traffic and intermittently rejects it with a
+        // plain-text 403; requests identifying as a Copilot editor
+        // integration (what VS Code and LiteLLM send) are treated as
+        // first-class. Mirrors LiteLLM's get_copilot_default_headers.
+        let (intent, api_version) = match protocol {
+            Protocol::AnthropicMessages => ("messages-proxy", "2026-06-01"),
+            _ => ("conversation-panel", "2025-04-01"),
+        };
+        request = request
+            .header("copilot-integration-id", "vscode-chat")
+            .header("editor-version", "vscode/1.95.0")
+            .header("editor-plugin-version", "copilot-chat/0.26.7")
+            .header("user-agent", "GitHubCopilotChat/0.26.7")
+            .header("x-vscode-user-agent-library-version", "electron-fetch")
+            .header("openai-intent", intent)
+            .header("x-github-api-version", api_version)
+            .header("x-request-id", uuid::Uuid::now_v7().to_string());
         // GitHub's Anthropic endpoint takes a Bearer token rather than the
         // standard x-api-key header; the version header still applies.
         if protocol == Protocol::AnthropicMessages {
-            request = request.header(
-                "anthropic-version",
-                inbound_headers
-                    .get("anthropic-version")
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or("2023-06-01"),
-            );
+            request = request
+                .header("x-interaction-type", "messages-proxy")
+                .header(
+                    "anthropic-version",
+                    inbound_headers
+                        .get("anthropic-version")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("2023-06-01"),
+                );
             if let Some(beta) = inbound_headers.get("anthropic-beta") {
                 request = request.header("anthropic-beta", beta);
             }
@@ -127,5 +147,42 @@ mod tests {
             },
         );
         assert!(matches!(class, FailureClass::ProviderAuth));
+    }
+
+    #[test]
+    fn requests_identify_as_a_copilot_editor_integration() {
+        let request = reqwest::Client::new().post("https://api.githubcopilot.com/responses");
+        let request = COPILOT.apply_auth(
+            request,
+            "token",
+            Protocol::OpenAiResponses,
+            &HeaderMap::new(),
+        );
+        let headers = request.build().unwrap().headers().clone();
+        assert_eq!(
+            headers.get("copilot-integration-id").unwrap(),
+            "vscode-chat"
+        );
+        assert_eq!(headers.get("editor-version").unwrap(), "vscode/1.95.0");
+        assert_eq!(
+            headers.get("user-agent").unwrap(),
+            "GitHubCopilotChat/0.26.7"
+        );
+        assert_eq!(headers.get("openai-intent").unwrap(), "conversation-panel");
+        assert_eq!(headers.get("x-github-api-version").unwrap(), "2025-04-01");
+        assert!(headers.get("x-request-id").is_some());
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer token");
+
+        let request = reqwest::Client::new().post("https://api.githubcopilot.com/v1/messages");
+        let request = COPILOT.apply_auth(
+            request,
+            "token",
+            Protocol::AnthropicMessages,
+            &HeaderMap::new(),
+        );
+        let headers = request.build().unwrap().headers().clone();
+        assert_eq!(headers.get("x-github-api-version").unwrap(), "2026-06-01");
+        assert_eq!(headers.get("x-interaction-type").unwrap(), "messages-proxy");
+        assert_eq!(headers.get("anthropic-version").unwrap(), "2023-06-01");
     }
 }

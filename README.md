@@ -354,6 +354,14 @@ Undeclared ingress protocols are translated at the protocol boundary.
 GitHub's Anthropic endpoint authenticates with a Bearer token rather than
 `x-api-key`; the adapter applies that automatically.
 
+Every outgoing request identifies itself as a Copilot editor integration
+(`copilot-integration-id`, `editor-version`, `user-agent`, and related
+headers, mirroring what VS Code and LiteLLM send). GitHub's edge applies
+risk heuristics to bearer-only API traffic and intermittently rejects it
+with a plain-text `403` citing the Terms of Service; editor-identified
+requests are exempt. Those edge rejections are classified as capacity, so
+the circuit reopens within seconds.
+
 Get the token once through GitHub's device flow: the **Sign in with GitHub**
 button on a Copilot credential in the Accounts page, or the login helper.
 
