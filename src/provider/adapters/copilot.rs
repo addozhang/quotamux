@@ -1,8 +1,12 @@
-use reqwest::{RequestBuilder, header::HeaderMap};
+use reqwest::{RequestBuilder, StatusCode, header::HeaderMap};
 
-use crate::{config::AdapterKind, types::Protocol};
+use crate::{
+    config::AdapterKind,
+    types::{FailureClass, Protocol},
+};
 
 use super::{EndpointPolicy, ProviderAdapter, ThinkingStyle, bearer_auth, standard_url};
+use crate::provider::{ErrorDetails, classify_status};
 
 pub(super) static COPILOT: Copilot = Copilot;
 
@@ -15,6 +19,26 @@ impl ProviderAdapter for Copilot {
 
     fn default_thinking_style(&self) -> Option<ThinkingStyle> {
         Some(ThinkingStyle::EffortLevels)
+    }
+
+    fn classify_error(&self, status: StatusCode, details: &ErrorDetails) -> FailureClass {
+        // GitHub's edge intermittently rejects bursty traffic with a
+        // plain-text 403 citing the Terms of Service. That is throttling,
+        // not a credential problem: genuine auth failures from the Copilot
+        // API arrive as structured JSON error bodies. Match the leading
+        // sentence — the message sanitizer collapses the markdown link that
+        // carries "Service" into "[url]", so longer phrases never survive.
+        // Classify this variant as capacity so the circuit reopens after
+        // seconds instead of locking the backend out for up to an hour.
+        if status == StatusCode::FORBIDDEN
+            && details
+                .classification_message
+                .to_ascii_lowercase()
+                .contains("access to this endpoint is forbidden")
+        {
+            return FailureClass::ProviderCapacity;
+        }
+        classify_status(status, &details.classification_message)
     }
 
     fn endpoint_policy(&self) -> EndpointPolicy {
@@ -58,5 +82,50 @@ impl ProviderAdapter for Copilot {
             }
         }
         bearer_auth(request, api_key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::extract_error_details;
+
+    const EDGE_FORBIDDEN_BODY: &str = "Access to this endpoint is forbidden. Please review our [Terms of Service](https://docs.github.com/en/site-policy/github-terms/github-terms-of-service).";
+
+    #[test]
+    fn edge_terms_of_service_403_is_capacity_not_auth() {
+        // Run the real body through the sanitizer pipeline: the markdown
+        // link collapses to "[url]", swallowing the word "Service".
+        let details = extract_error_details(EDGE_FORBIDDEN_BODY.as_bytes());
+        assert!(details.classification_message.contains("[url]"));
+        let class = COPILOT.classify_error(StatusCode::FORBIDDEN, &details);
+        assert!(matches!(class, FailureClass::ProviderCapacity));
+    }
+
+    #[test]
+    fn structured_or_other_403s_stay_authentication_failures() {
+        // JSON-shaped auth errors carry no edge boilerplate.
+        let class = COPILOT.classify_error(
+            StatusCode::FORBIDDEN,
+            &ErrorDetails {
+                classification_message: "{\"error\":\"forbidden\"}".into(),
+                safe_message: String::new(),
+                error_type: None,
+                upstream_type: None,
+                upstream_code: None,
+            },
+        );
+        assert!(matches!(class, FailureClass::ProviderAuth));
+        let class = COPILOT.classify_error(
+            StatusCode::UNAUTHORIZED,
+            &ErrorDetails {
+                classification_message: "Bad credentials".into(),
+                safe_message: String::new(),
+                error_type: None,
+                upstream_type: None,
+                upstream_code: None,
+            },
+        );
+        assert!(matches!(class, FailureClass::ProviderAuth));
     }
 }

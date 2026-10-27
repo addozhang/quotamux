@@ -415,7 +415,7 @@ fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
     when.duration_since(std::time::SystemTime::now()).ok()
 }
 
-fn extract_error_details(bytes: &[u8]) -> ErrorDetails {
+pub(super) fn extract_error_details(bytes: &[u8]) -> ErrorDetails {
     if let Ok(value) = serde_json::from_slice::<Value>(bytes)
         && let Some(details) = extract_error_details_from_value(&value)
     {
