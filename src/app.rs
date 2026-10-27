@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, hash_map::Entry},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque, hash_map::Entry},
     convert::Infallible,
     sync::Arc,
     time::{Duration, Instant},
@@ -1019,6 +1019,13 @@ async fn handle_nonstream(
 
     let response_bytes = serde_json::to_vec(&outcome.body).unwrap_or_default();
     let usage = completed_usage(outcome.egress, &outcome.raw_upstream);
+    log_empty_completion(
+        "non-stream completion",
+        &request_id,
+        &served_model.name,
+        &usage,
+        &outcome.raw_upstream.to_string(),
+    );
     let record = RequestRecord {
         id: request_id.clone(),
         started_at_ms,
@@ -1496,6 +1503,11 @@ async fn handle_stream(
         let mut generated = GeneratedTextBytes::default();
         let mut stream_error = None;
         let mut stream_error_message = None;
+        // Evidence retained for the empty-completion log: the final upstream
+        // SSE events plus the terminal finish_reason when the upstream speaks
+        // chat completions.
+        let mut upstream_tail: VecDeque<String> = VecDeque::with_capacity(STREAM_TAIL_EVENTS);
+        let mut finish_reason: Option<String> = None;
         let mut response_translator =
             responses::ChatToResponsesStream::new(requested_model.clone(), body.clone());
         let mut anthropic_translator =
@@ -1537,10 +1549,19 @@ async fn handle_stream(
                         }
                         break;
                     }
+                    upstream_tail.push_back(truncate_for_log(&event.data, STREAM_TAIL_EVENT_BYTES));
+                    while upstream_tail.len() > STREAM_TAIL_EVENTS {
+                        upstream_tail.pop_front();
+                    }
                     if translated {
                         match serde_json::from_str::<Value>(&event.data) {
                             Ok(upstream_chunk) => {
                                 let upstream_type=upstream_chunk.get("type").and_then(Value::as_str);
+                                if egress == Protocol::OpenAiChat
+                                    && let Some(reason) = chat_finish_reason(&upstream_chunk)
+                                {
+                                    finish_reason = Some(reason.to_owned());
+                                }
                                 if let Some(class) = stream_error_class(&provider_client, upstream_status, &event, Some(&upstream_chunk)) {
                                     stream_error=Some(class);
                                     stream_error_message=Some("upstream returned a semantic SSE error".into());
@@ -1592,6 +1613,11 @@ async fn handle_stream(
                             }
                         };
                         let semantic_error=stream_error_class(&provider_client, upstream_status, &event, Some(&parsed));
+                        if egress == Protocol::OpenAiChat
+                            && let Some(reason) = chat_finish_reason(&parsed)
+                        {
+                            finish_reason = Some(reason.to_owned());
+                        }
                         observe_stream_usage(protocol, &mut usage, &parsed);
                         generated.observe_stream_event(protocol, &parsed);
                         let event_type=event.event.as_deref().or_else(||parsed.get("type")?.as_str());
@@ -1619,6 +1645,18 @@ async fn handle_stream(
         }
         let completed_at_ms=Utc::now().timestamp_millis();
         usage.estimate_reasoning(generated);
+        if stream_error.is_none() {
+            log_empty_completion(
+                "stream completion",
+                &request_id_for_stream,
+                &configured_model,
+                &usage,
+                &format!(
+                    "finish_reason={finish_reason:?} tail={}",
+                    upstream_tail.iter().cloned().collect::<Vec<_>>().join(" | ")
+                ),
+            );
+        }
         let attempt = AttemptRecord {
             id:attempt_id,
             request_id:Some(request_id_for_stream.clone()),
@@ -2328,6 +2366,48 @@ fn completed_usage(protocol: Protocol, value: &Value) -> Usage {
     usage
 }
 
+/// Upstreams occasionally answer 200 with a well-formed envelope and almost
+/// no content (observed on `gemini-4-argon`: 8 output tokens after a 53s
+/// first byte, five identical retries). Clients see an empty completion and
+/// the attempt ledger only records metadata, so log the upstream evidence
+/// whenever a successful completion stays under this many output tokens.
+const EMPTY_COMPLETION_OUTPUT_TOKENS: u64 = 32;
+const EMPTY_COMPLETION_EVIDENCE_BYTES: usize = 2048;
+const STREAM_TAIL_EVENTS: usize = 4;
+const STREAM_TAIL_EVENT_BYTES: usize = 512;
+
+fn is_likely_empty_completion(usage: &Usage) -> bool {
+    usage.output_tokens < EMPTY_COMPLETION_OUTPUT_TOKENS
+}
+
+fn truncate_for_log(value: &str, limit: usize) -> String {
+    value.chars().take(limit).collect()
+}
+
+/// Best-effort `finish_reason` from an upstream chat-completions chunk.
+fn chat_finish_reason(chunk: &Value) -> Option<&str> {
+    chunk["choices"][0]["finish_reason"].as_str()
+}
+
+fn log_empty_completion(
+    context: &str,
+    request_id: &str,
+    model: &str,
+    usage: &Usage,
+    evidence: &str,
+) {
+    if is_likely_empty_completion(usage) {
+        tracing::warn!(
+            request_id = %request_id,
+            model = %model,
+            output_tokens = usage.output_tokens,
+            input_tokens = usage.input_tokens,
+            evidence = %truncate_for_log(evidence, EMPTY_COMPLETION_EVIDENCE_BYTES),
+            "{context}: upstream returned 200 with almost no output"
+        );
+    }
+}
+
 fn observe_stream_usage(protocol: Protocol, current: &mut Usage, value: &Value) {
     if protocol == Protocol::AnthropicMessages {
         current.observe_anthropic_stream_event(value);
@@ -2983,6 +3063,40 @@ mod tests {
     use super::*;
     use crate::config::ThinkingLevel;
     use crate::provider::adapters::ThinkingStyle;
+
+    #[test]
+    fn empty_completion_threshold_matches_observable_empties() {
+        let empty = crate::types::Usage {
+            output_tokens: 8,
+            ..Default::default()
+        };
+        assert!(is_likely_empty_completion(&empty));
+        let substantive = crate::types::Usage {
+            output_tokens: EMPTY_COMPLETION_OUTPUT_TOKENS,
+            ..Default::default()
+        };
+        assert!(!is_likely_empty_completion(&substantive));
+    }
+
+    #[test]
+    fn chat_finish_reason_reads_terminal_chunks_only() {
+        assert_eq!(
+            chat_finish_reason(&json!({"choices":[{"delta":{"content":"hi"}}]})),
+            None
+        );
+        assert_eq!(
+            chat_finish_reason(&json!({"choices":[{"finish_reason":"stop"}]})),
+            Some("stop")
+        );
+        assert_eq!(chat_finish_reason(&json!({"object":"list"})), None);
+    }
+
+    #[test]
+    fn truncate_for_log_cuts_on_char_boundaries() {
+        let text = "你好世界".repeat(100);
+        let cut = truncate_for_log(&text, 10);
+        assert_eq!(cut.chars().count(), 10);
+    }
 
     #[test]
     fn default_thinking_injects_effort_for_level_adapters() {
