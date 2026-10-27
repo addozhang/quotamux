@@ -127,7 +127,7 @@ pub struct CircuitBreaker {
     state: Mutex<CircuitSnapshot>,
     changes: watch::Sender<u64>,
     store: Store,
-    store_key: String,
+    pub(crate) store_key: String,
 }
 
 impl CircuitBreaker {
@@ -305,6 +305,19 @@ impl CircuitBreaker {
         self.state.lock().await.clone()
     }
 
+    /// Force the breaker closed immediately, discarding any open or
+    /// half-open backoff. Bumping the generation invalidates in-flight
+    /// probe permits so a stale completion cannot re-open the circuit.
+    pub async fn reset(&self) {
+        let mut state = self.state.lock().await;
+        let generation = next_generation(state.generation);
+        *state = CircuitSnapshot {
+            generation,
+            ..CircuitSnapshot::default()
+        };
+        self.persist_and_publish(&state);
+    }
+
     fn persist(&self, state: &CircuitSnapshot) {
         if let Err(error) = self.store.put_state(&self.store_key, state) {
             tracing::error!(%error, "failed to persist circuit state");
@@ -450,6 +463,29 @@ mod tests {
             .failure(FailureClass::ProviderAuth, None)
             .await;
         assert_eq!(circuit.snapshot().await.mode, CircuitMode::Suspended);
+    }
+
+    #[tokio::test]
+    async fn reset_clears_open_backoff_and_persists_a_closed_circuit() {
+        let (dir, circuit) = test_circuit().await;
+        primary(circuit.decide().await)
+            .failure(FailureClass::ProviderAuth, None)
+            .await;
+        assert_eq!(circuit.snapshot().await.mode, CircuitMode::Suspended);
+
+        circuit.reset().await;
+        let snapshot = circuit.snapshot().await;
+        assert_eq!(snapshot.mode, CircuitMode::Closed);
+        assert_eq!(snapshot.reason, None);
+        assert_eq!(snapshot.backoff_level, 0);
+        assert_eq!(snapshot.next_probe_at_ms, None);
+
+        // The closed state survives a reload instead of the old schedule.
+        let store_key = circuit.store_key.clone();
+        drop(circuit);
+        let store = Store::open(dir.path()).unwrap();
+        let reloaded = CircuitBreaker::load(store, &store_key).unwrap();
+        assert_eq!(reloaded.snapshot().await.mode, CircuitMode::Closed);
     }
 
     #[tokio::test]

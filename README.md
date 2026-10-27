@@ -650,6 +650,7 @@ interface.
 | `GET /api/routing/stats?model=NAME&window=1d` | Target/key routing totals for `1h`, `1d`, `1w`, `1m`, or `all`. |
 | `GET /api/requests?limit=20&before=CURSOR` | Cursor-paginated logical request records; optional `model=NAME` filters before pagination. |
 | `GET /api/attempts?limit=100` | Recent per-target attempts. |
+| `POST /api/circuits/reset?backend=ID&model=ID` | Force circuit breakers closed without waiting out their backoff schedule; both filters are optional and combine with AND. Use after verifying the upstream is healthy again. |
 
 Finite statistics ranges are rolling intervals ending at the last completed
 minute. Current account/credential alerts remain on All, independent of the

@@ -415,6 +415,7 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .route("/requests", get(requests))
         .route("/attempts", get(attempts))
         .route("/upstream-errors", get(upstream_errors))
+        .route("/circuits/reset", post(circuits_reset))
         .fallback(api_not_found);
     Router::new()
         .route("/healthz", get(health))
@@ -2789,6 +2790,51 @@ fn safe_endpoint(endpoint: &str) -> String {
     url.set_query(None);
     url.set_fragment(None);
     url.to_string().trim_end_matches('/').to_string()
+}
+
+#[derive(Deserialize)]
+struct CircuitsResetQuery {
+    backend: Option<String>,
+    model: Option<String>,
+}
+
+/// Force circuit breakers closed without waiting out their backoff. Used
+/// when an operator has verified the upstream is healthy again (for
+/// example after a misclassified failure opened a long schedule).
+/// Optional `backend` and `model` filters narrow the reset; without them
+/// every target circuit is reset.
+async fn circuits_reset(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<CircuitsResetQuery>,
+) -> Json<Value> {
+    let mut reset = Vec::new();
+    let mut seen = HashSet::new();
+    for model in &state.config.models {
+        for layer in &model.layers {
+            for target in &layer.targets {
+                if !seen.insert(target) {
+                    continue;
+                }
+                if let Some(backend) = &query.backend
+                    && backend != &target.backend
+                {
+                    continue;
+                }
+                if let Some(model_filter) = &query.model
+                    && model_filter != &target.model
+                {
+                    continue;
+                }
+                let runtime = target_runtime(&state, target);
+                runtime.circuit.reset().await;
+                reset.push(format!(
+                    "{}/{}/{}",
+                    target.backend, target.credential, target.model
+                ));
+            }
+        }
+    }
+    Json(json!({"reset": reset.len(), "targets": reset}))
 }
 
 #[derive(Deserialize)]
