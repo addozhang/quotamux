@@ -474,13 +474,7 @@ fn copy_field(
 }
 
 fn reasoning_fragment(message: &Value) -> Option<&str> {
-    let nonempty = |key| {
-        message
-            .get(key)
-            .and_then(Value::as_str)
-            .filter(|text| !text.is_empty())
-    };
-    nonempty("reasoning_content").or_else(|| nonempty("reasoning"))
+    crate::types::chat_reasoning_text(message)
 }
 
 pub fn chat_to_response(chat: &Value, response_model: &str, request: &Value) -> Value {

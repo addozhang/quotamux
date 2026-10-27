@@ -114,10 +114,27 @@ pub struct Usage {
 /// reasoning or answer content.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct GeneratedTextBytes {
-    /// Thinking/reasoning text, including `reasoning` and `reasoning_content`.
+    /// Thinking/reasoning text, including `reasoning`, `reasoning_content`
+    /// and `reasoning_text`.
     pub reasoning: u64,
     /// Answer text and generated tool-call arguments.
     pub other: u64,
+}
+
+/// Reasoning text carried by a chat-completions message or delta. Upstreams
+/// disagree on the field name: DeepSeek writes `reasoning_content`, GitHub
+/// Copilot's Gemini models write `reasoning_text`, others use `reasoning`.
+/// The first non-empty field wins; translations map it into protocol-native
+/// thinking blocks instead of dropping it.
+pub fn chat_reasoning_text(message: &Value) -> Option<&str> {
+    ["reasoning_content", "reasoning_text", "reasoning"]
+        .iter()
+        .find_map(|key| {
+            message
+                .get(*key)
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+        })
 }
 
 impl GeneratedTextBytes {
@@ -133,8 +150,9 @@ impl GeneratedTextBytes {
 
     /// Counts one chat-completions message or streaming delta.
     fn observe_chat_message(&mut self, message: &Value) {
-        Self::observe_text(&mut self.reasoning, message.get("reasoning_content"));
-        Self::observe_text(&mut self.reasoning, message.get("reasoning"));
+        if let Some(text) = chat_reasoning_text(message) {
+            self.reasoning = self.reasoning.saturating_add(text.len() as u64);
+        }
         Self::observe_text(&mut self.other, message.get("content"));
         for call in message
             .get("tool_calls")
