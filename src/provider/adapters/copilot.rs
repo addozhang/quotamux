@@ -72,10 +72,13 @@ impl ProviderAdapter for Copilot {
         // plain-text 403; requests identifying as a Copilot editor
         // integration (what VS Code and LiteLLM send) are treated as
         // first-class. Mirrors LiteLLM's get_copilot_default_headers.
-        let (intent, api_version) = match protocol {
-            Protocol::AnthropicMessages => ("messages-proxy", "2026-06-01"),
-            _ => ("conversation-panel", "2025-04-01"),
+        let intent = match protocol {
+            Protocol::AnthropicMessages => "messages-proxy",
+            _ => "conversation-panel",
         };
+        // VS Code's Copilot extension pins 2026-06-01 across every
+        // endpoint (see _mixinHeaders in its extension bundle).
+        let api_version = "2026-06-01";
         request = request
             .header("copilot-integration-id", "vscode-chat")
             .header("editor-version", "vscode/1.95.0")
@@ -169,7 +172,7 @@ mod tests {
             "GitHubCopilotChat/0.26.7"
         );
         assert_eq!(headers.get("openai-intent").unwrap(), "conversation-panel");
-        assert_eq!(headers.get("x-github-api-version").unwrap(), "2025-04-01");
+        assert_eq!(headers.get("x-github-api-version").unwrap(), "2026-06-01");
         assert!(headers.get("x-request-id").is_some());
         assert_eq!(headers.get("authorization").unwrap(), "Bearer token");
 
