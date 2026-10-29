@@ -2377,9 +2377,9 @@ fn completed_usage(protocol: Protocol, value: &Value) -> Usage {
 /// first byte, five identical retries). Clients see an empty completion and
 /// the attempt ledger only records metadata, so log the upstream evidence
 /// whenever a successful completion stays under this many output tokens.
-const EMPTY_COMPLETION_OUTPUT_TOKENS: u64 = 32;
+const EMPTY_COMPLETION_OUTPUT_TOKENS: u64 = 64;
 const EMPTY_COMPLETION_EVIDENCE_BYTES: usize = 2048;
-const STREAM_TAIL_EVENTS: usize = 4;
+const STREAM_TAIL_EVENTS: usize = 8;
 const STREAM_TAIL_EVENT_BYTES: usize = 512;
 
 fn is_likely_empty_completion(usage: &Usage) -> bool {
