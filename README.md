@@ -324,7 +324,9 @@ QuotaMux rejects a Go model that is not in the adapter catalog. The catalog
 follows the [OpenCode Go endpoint table](https://dev.opencode.ai/docs/go/#endpoints).
 
 For the other official adapters, declare the native protocols enabled for each
-model. The adapter verifies that every declaration is supported by that API.
+model, except `github-copilot`, whose catalog supplies the endpoint (see
+[GitHub Copilot](#github-copilot)). The adapter verifies that every declaration
+is supported by that API.
 Kimi Code and the Kimi Open Platform are separate services with separate keys;
 their adapters and backends must remain separate. See the
 [Kimi Code API overview](https://www.kimi.com/code/docs/) and
@@ -343,14 +345,32 @@ the [OpenCode GLM-5.3-Flash model data](https://opencode.ai/data/zhipu/glm-5-3-f
 ### GitHub Copilot
 
 The `github-copilot` adapter talks to `https://api.githubcopilot.com` with
-native Chat, Responses, and Anthropic Messages egress. List the model IDs
-enabled on your plan with
-`curl -H "Authorization: Bearer $TOKEN" https://api.githubcopilot.com/models`
-and check each model's `supported_endpoints`: newer models such as
-`gpt-6-sol` only serve the Responses API, so declare
-`protocols = ["openai-responses"]` for them; Claude models also serve the
-native Anthropic endpoint and can declare `anthropic-messages` too.
-Undeclared ingress protocols are translated at the protocol boundary.
+native Chat, Responses, and Anthropic Messages egress. Its official catalog owns
+each model's endpoint, so `[[backends.models]]` may omit `protocols`:
+
+| Model family | Native egress |
+| --- | --- |
+| `gpt-5.3-*`, `gpt-5.4-*`, `gpt-5.6-*`, `gpt-6*`, `mai-code-1.1-flash`, `grok-4.*` | Responses only |
+| `gemini-*`, `kimi-k3*`, `copilot-search-*` | Chat only |
+| `mai-code-1-flash-*` | Chat and Responses |
+| `claude-*` | Anthropic Messages and Chat |
+
+Claude models keep the native Anthropic endpoint, which preserves thinking
+budgets, cache markers, and tool semantics without translation. Chat and
+Anthropic ingress for a Responses-only model is translated at the protocol
+boundary, and `protocol_for` prefers a native Chat endpoint whenever the model
+serves one.
+
+Declaring `protocols` is optional. A declared set must stay within the catalog,
+otherwise startup rejects the configuration; a model the catalog does not list
+(including the legacy `gpt-4o` family, which `GET /models` reports without
+endpoints) still has to be declared explicitly. The catalog mirrors each
+model's `supported_endpoints`, verified against live calls. List the models
+enabled on your plan with:
+
+```sh
+curl -H "Authorization: Bearer $TOKEN" https://api.githubcopilot.com/models
+```
 GitHub's Anthropic endpoint authenticates with a Bearer token rather than
 `x-api-key`; the adapter applies that automatically.
 

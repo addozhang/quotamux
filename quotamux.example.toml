@@ -197,12 +197,14 @@ api_key = ""
 [[backends.models]]
 # Set the exact model IDs enabled on your Copilot plan:
 #   curl -H "Authorization: Bearer $TOKEN" https://api.githubcopilot.com/models
-# gpt-6-sol and other newer models only serve the Responses API; declare
-# openai-responses alone so Chat and Anthropic ingress is translated.
+# The adapter owns each model's endpoint through its official catalog, so
+# `protocols` can be omitted: the GPT models use Responses, Gemini and the
+# Kimi Copilot models use Chat, and Claude models keep the native Anthropic
+# endpoint. Declare `protocols` only to narrow that catalog or to enable a
+# model the catalog does not list.
 # default_thinking_level (off/low/medium/high/xhigh/max) applies when the
 # request carries no reasoning parameter.
 name = "gpt-6-sol"
-protocols = ["openai-responses"]
 default_thinking_level = "medium"
 
 [[backends]]

@@ -195,13 +195,32 @@ impl BackendClient {
         }
         let protocols = match adapter.model_protocol_policy() {
             ModelProtocolPolicy::Listed => model.protocols.clone(),
-            ModelProtocolPolicy::OfficialCatalog => {
-                vec![adapter.protocol_for_model(&model.name).ok_or_else(|| {
-                    BackendBuildError::UnknownModel {
-                        backend: backend.id.clone(),
-                        model: model.name.clone(),
+            ModelProtocolPolicy::OfficialCatalog => adapter
+                .native_protocols_for_model(&model.name)
+                .ok_or_else(|| BackendBuildError::UnknownModel {
+                    backend: backend.id.clone(),
+                    model: model.name.clone(),
+                })?
+                .to_vec(),
+            ModelProtocolPolicy::OfficialCatalogOverridable => {
+                match adapter.native_protocols_for_model(&model.name) {
+                    Some(catalog) if model.protocols.is_empty() => catalog.to_vec(),
+                    Some(catalog) => {
+                        if let Some(protocol) = model
+                            .protocols
+                            .iter()
+                            .find(|protocol| !catalog.contains(protocol))
+                        {
+                            return Err(BackendBuildError::UnsupportedProtocol {
+                                backend: backend.id.clone(),
+                                model: model.name.clone(),
+                                protocol: protocol.as_str(),
+                            });
+                        }
+                        model.protocols.clone()
                     }
-                })?]
+                    None => model.protocols.clone(),
+                }
             }
         };
         if protocols.is_empty() {
@@ -689,13 +708,17 @@ mod tests {
             ),
         ] {
             for model in models {
-                assert_eq!(adapter.protocol_for_model(model), Some(protocol), "{model}");
+                assert_eq!(
+                    adapter.native_protocols_for_model(model),
+                    Some(&[protocol][..]),
+                    "{model}"
+                );
                 let client = client_for(AdapterKind::OpenCodeGo, model);
                 assert_eq!(client.protocol_for(protocol), protocol, "{model}");
             }
         }
         assert_eq!(
-            adapter.protocol_for_model("not-in-the-official-catalog"),
+            adapter.native_protocols_for_model("not-in-the-official-catalog"),
             None
         );
     }

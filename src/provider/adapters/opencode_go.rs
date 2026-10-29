@@ -34,9 +34,12 @@ impl ProviderAdapter for OpenCodeGo {
         ModelProtocolPolicy::OfficialCatalog
     }
 
-    fn protocol_for_model(&self, model: &str) -> Option<Protocol> {
+    fn native_protocols_for_model(&self, model: &str) -> Option<&'static [Protocol]> {
+        const RESPONSES: &[Protocol] = &[Protocol::OpenAiResponses];
+        const CHAT: &[Protocol] = &[Protocol::OpenAiChat];
+        const ANTHROPIC: &[Protocol] = &[Protocol::AnthropicMessages];
         match model {
-            "grok-4.5" | "gpt-5.6-luna" => Some(Protocol::OpenAiResponses),
+            "grok-4.5" | "gpt-5.6-luna" => Some(RESPONSES),
             "glm-5.3-flash"
             | "glm-5.3"
             | "glm-5.2"
@@ -50,9 +53,9 @@ impl ProviderAdapter for OpenCodeGo {
             | "deepseek-v4-flash-vision-exp"
             | "mimo-v2.5"
             | "mimo-v2.5-pro"
-            | "hy3" => Some(Protocol::OpenAiChat),
+            | "hy3" => Some(CHAT),
             "minimax-m3" | "minimax-m2.7" | "minimax-m2.5" | "qwen3.8-max" | "qwen3.7-max"
-            | "qwen3.7-plus" | "qwen3.6-plus" => Some(Protocol::AnthropicMessages),
+            | "qwen3.7-plus" | "qwen3.6-plus" => Some(ANTHROPIC),
             _ => None,
         }
     }

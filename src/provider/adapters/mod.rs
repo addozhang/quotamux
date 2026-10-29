@@ -25,7 +25,14 @@ pub enum EndpointPolicy {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModelProtocolPolicy {
     Listed,
+    /// The adapter's catalog owns every model endpoint. Configuring
+    /// `protocols` is an error.
     OfficialCatalog,
+    /// The adapter's catalog supplies the default protocols for a known model
+    /// and rejects a declared set the model cannot serve. A model outside the
+    /// catalog may still be declared explicitly, so a newly published upstream
+    /// model never needs a QuotaMux release.
+    OfficialCatalogOverridable,
 }
 
 /// How an upstream expects a thinking preference to be spelled.
@@ -52,7 +59,10 @@ pub trait ProviderAdapter: Send + Sync {
         ModelProtocolPolicy::Listed
     }
 
-    fn protocol_for_model(&self, _model: &str) -> Option<Protocol> {
+    /// Every protocol the provider's official catalog serves for this exact
+    /// upstream model, most native first. `None` means the catalog does not
+    /// know the model.
+    fn native_protocols_for_model(&self, _model: &str) -> Option<&'static [Protocol]> {
         None
     }
 

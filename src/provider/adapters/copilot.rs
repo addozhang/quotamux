@@ -5,16 +5,60 @@ use crate::{
     types::{FailureClass, Protocol},
 };
 
-use super::{EndpointPolicy, ProviderAdapter, ThinkingStyle, bearer_auth, standard_url};
+use super::{
+    EndpointPolicy, ModelProtocolPolicy, ProviderAdapter, ThinkingStyle, bearer_auth, standard_url,
+};
 use crate::provider::{ErrorDetails, classify_status};
 
 pub(super) static COPILOT: Copilot = Copilot;
 
 pub(super) struct Copilot;
 
+/// Responses is the only endpoint the current GPT-6 family serves; the
+/// Anthropic-compatible endpoint answers `no_available_model_endpoints` for
+/// these models. Gemini and the Kimi Copilot models serve Chat only.
+const RESPONSES_ONLY: &[Protocol] = &[Protocol::OpenAiResponses];
+const CHAT_ONLY: &[Protocol] = &[Protocol::OpenAiChat];
+const CHAT_AND_RESPONSES: &[Protocol] = &[Protocol::OpenAiChat, Protocol::OpenAiResponses];
+/// Claude models serve a native Anthropic endpoint, which preserves thinking
+/// budgets, cache markers, and tool semantics without translation.
+const ANTHROPIC_AND_CHAT: &[Protocol] = &[Protocol::AnthropicMessages, Protocol::OpenAiChat];
+
 impl ProviderAdapter for Copilot {
     fn kind(&self) -> AdapterKind {
         AdapterKind::Copilot
+    }
+
+    fn model_protocol_policy(&self) -> ModelProtocolPolicy {
+        ModelProtocolPolicy::OfficialCatalogOverridable
+    }
+
+    /// Mirrors each model's `supported_endpoints` in `GET /models`, verified
+    /// against live calls. Models the catalog lists without endpoints (legacy
+    /// `gpt-4o` and embedding models) are omitted on purpose: declare their
+    /// protocols explicitly if you enable them.
+    fn native_protocols_for_model(&self, model: &str) -> Option<&'static [Protocol]> {
+        match model {
+            "gpt-5.3-codex" | "gpt-5.4-nano" | "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra"
+            | "gpt-6-sol" | "gpt-6-astra" | "gpt-6-luna" | "gpt-6.1-sol" | "gpt-6.1-terra"
+            | "mai-code-1.1-flash" | "grok-4.6" | "grok-4.7" => Some(RESPONSES_ONLY),
+            "gemini-3.8-flash" | "gemini-4-argon" | "kimi-k3" | "kimi-k3-base"
+            | "kimi-k3-copilot" | "copilot-search-a" | "copilot-search-b" => Some(CHAT_ONLY),
+            "mai-code-1-flash-4th" | "mai-code-1-flash-secondary" | "mai-code-1-flash-tertiary" => {
+                Some(CHAT_AND_RESPONSES)
+            }
+            "claude-haiku-4.5"
+            | "claude-haiku-5.5"
+            | "claude-sonnet-5"
+            | "claude-sonnet-5.5"
+            | "claude-opus-4.8"
+            | "claude-opus-4.8-fast"
+            | "claude-opus-5"
+            | "claude-opus-5.5"
+            | "claude-fable-5"
+            | "claude-fable-5.1" => Some(ANTHROPIC_AND_CHAT),
+            _ => None,
+        }
     }
 
     fn default_thinking_style(&self) -> Option<ThinkingStyle> {
@@ -150,6 +194,29 @@ mod tests {
             },
         );
         assert!(matches!(class, FailureClass::ProviderAuth));
+    }
+
+    #[test]
+    fn catalog_serves_each_family_through_its_native_endpoint() {
+        assert_eq!(
+            COPILOT.native_protocols_for_model("gpt-6.1-sol"),
+            Some(RESPONSES_ONLY)
+        );
+        assert_eq!(
+            COPILOT.native_protocols_for_model("gemini-4-argon"),
+            Some(CHAT_ONLY)
+        );
+        assert_eq!(
+            COPILOT.native_protocols_for_model("mai-code-1-flash-4th"),
+            Some(CHAT_AND_RESPONSES)
+        );
+        assert_eq!(
+            COPILOT.native_protocols_for_model("claude-sonnet-5.5"),
+            Some(ANTHROPIC_AND_CHAT)
+        );
+        // The /models catalog lists legacy models without endpoints; they stay
+        // opt-in through an explicit declaration.
+        assert_eq!(COPILOT.native_protocols_for_model("gpt-4o"), None);
     }
 
     #[test]

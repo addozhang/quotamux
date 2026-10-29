@@ -575,14 +575,44 @@ fn validate_backend(path: &str, backend: &BackendConfig) -> Result<(), ConfigErr
                         backend.adapter.as_str()
                     )));
                 }
-                let expected = adapter.protocol_for_model(&model.name).ok_or_else(|| {
-                    invalid(format!(
-                        "{model_path}.name {} is not in the current official catalog for adapter {}",
-                        model.name,
-                        backend.adapter.as_str()
-                    ))
-                })?;
-                vec![expected]
+                adapter
+                    .native_protocols_for_model(&model.name)
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "{model_path}.name {} is not in the current official catalog for adapter {}",
+                            model.name,
+                            backend.adapter.as_str()
+                        ))
+                    })?
+                    .to_vec()
+            }
+            ModelProtocolPolicy::OfficialCatalogOverridable => {
+                match adapter.native_protocols_for_model(&model.name) {
+                    Some(catalog) if model.protocols.is_empty() => catalog.to_vec(),
+                    Some(catalog) => {
+                        if let Some(protocol) = model
+                            .protocols
+                            .iter()
+                            .find(|protocol| !catalog.contains(protocol))
+                        {
+                            return Err(invalid(format!(
+                                "{model_path}.protocols contains {} but model {} does not serve that endpoint on adapter {}",
+                                protocol.as_str(),
+                                model.name,
+                                backend.adapter.as_str()
+                            )));
+                        }
+                        model.protocols.clone()
+                    }
+                    None if model.protocols.is_empty() => {
+                        return Err(invalid(format!(
+                            "{model_path}.protocols must not be empty: model {} is not in the {} catalog, so its endpoints have to be declared",
+                            model.name,
+                            backend.adapter.as_str()
+                        )));
+                    }
+                    None => model.protocols.clone(),
+                }
             }
             ModelProtocolPolicy::Listed => {
                 if model.protocols.is_empty() {
@@ -996,6 +1026,45 @@ data_dir = "data"
         config.backends[0].models[0].protocols = vec![Protocol::OpenAiChat];
         config.backends[0].endpoint = Some("https://gateway.example/v1/chat/completions".into());
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn copilot_catalog_supplies_endpoints_and_rejects_unsupported_declarations() {
+        let adapter = adapter_for(AdapterKind::Copilot).unwrap();
+
+        // Nothing declared: the catalog supplies the only endpoint gpt serves.
+        let mut config = valid();
+        config.backends[0].adapter = AdapterKind::Copilot;
+        config.backends[0].models[0].name = "gpt-6.1-sol".into();
+        config.backends[0].models[0].protocols = Vec::new();
+        config.models[0].layers[0].targets[0].model = "gpt-6.1-sol".into();
+        config.validate().unwrap();
+        assert_eq!(
+            adapter.native_protocols_for_model("gpt-6.1-sol"),
+            Some(&[Protocol::OpenAiResponses][..])
+        );
+
+        // Gemini serves Chat only, so a Responses declaration is rejected.
+        config.backends[0].models[0].name = "gemini-4-argon".into();
+        config.models[0].layers[0].targets[0].model = "gemini-4-argon".into();
+        config.backends[0].models[0].protocols = vec![Protocol::OpenAiResponses];
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("does not serve that endpoint"), "{error}");
+
+        config.backends[0].models[0].protocols = Vec::new();
+        config.validate().unwrap();
+
+        // A model the catalog does not list still needs its endpoints declared.
+        config.backends[0].models[0].name = "gpt-4o".into();
+        config.models[0].layers[0].targets[0].model = "gpt-4o".into();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("not in the github-copilot catalog"),
+            "{error}"
+        );
+
+        config.backends[0].models[0].protocols = vec![Protocol::OpenAiChat];
+        config.validate().unwrap();
     }
 
     #[test]
