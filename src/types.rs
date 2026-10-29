@@ -124,8 +124,9 @@ pub struct GeneratedTextBytes {
 /// Reasoning text carried by a chat-completions message or delta. Upstreams
 /// disagree on the field name: DeepSeek writes `reasoning_content`, GitHub
 /// Copilot's Gemini models write `reasoning_text`, others use `reasoning`.
-/// The first non-empty field wins; translations map it into protocol-native
-/// thinking blocks instead of dropping it.
+/// The first non-empty field wins. The chat→Responses translation surfaces it
+/// as a reasoning item; Anthropic egress never turns it into a thinking block,
+/// because those carry a signature only the upstream can issue.
 pub fn chat_reasoning_text(message: &Value) -> Option<&str> {
     ["reasoning_content", "reasoning_text", "reasoning"]
         .iter()

@@ -420,13 +420,6 @@ pub fn chat_to_message(chat: &Value, response_model: &str) -> Value {
         .unwrap_or(Value::Null);
     let message = choice.get("message").cloned().unwrap_or(Value::Null);
     let mut content = Vec::new();
-    // Gemini-style upstreams answer with `reasoning_text` alongside (or
-    // instead of) `content`; surface it as a thinking block so clients see
-    // the reasoning instead of an empty message when it consumed the
-    // completion budget.
-    if let Some(reasoning) = crate::types::chat_reasoning_text(&message) {
-        content.push(json!({"type":"thinking","thinking":reasoning}));
-    }
     if let Some(text) = message
         .get("content")
         .and_then(Value::as_str)
@@ -514,7 +507,6 @@ pub struct ChatToAnthropicStream {
     id: String,
     response_model: String,
     block_index: u64,
-    thinking_open: bool,
     text_open: bool,
     calls: std::collections::BTreeMap<u64, (u64, String, String, String)>,
     usage: Usage,
@@ -528,7 +520,6 @@ impl ChatToAnthropicStream {
             id: format!("msg_{}", Uuid::now_v7()),
             response_model: response_model.into(),
             block_index: 0,
-            thinking_open: false,
             text_open: false,
             calls: Default::default(),
             usage: Usage::default(),
@@ -561,20 +552,12 @@ impl ChatToAnthropicStream {
                 .into();
             }
             let delta = choice.get("delta").unwrap_or(&Value::Null);
-            if let Some(reasoning) = crate::types::chat_reasoning_text(delta) {
-                if !self.thinking_open {
-                    self.thinking_open = true;
-                    events.push(SseEvent::json("content_block_start", &json!({"type":"content_block_start","index":self.block_index,"content_block":{"type":"thinking","thinking":""}})));
-                }
-                events.push(SseEvent::json("content_block_delta", &json!({"type":"content_block_delta","index":self.block_index,"delta":{"type":"thinking_delta","thinking":reasoning}})));
-            }
             if let Some(text) = delta
                 .get("content")
                 .and_then(Value::as_str)
                 .filter(|v| !v.is_empty())
             {
                 if !self.text_open {
-                    self.close_thinking(&mut events);
                     self.text_open = true;
                     events.push(SseEvent::json("content_block_start", &json!({"type":"content_block_start","index":self.block_index,"content_block":{"type":"text","text":""}})));
                 }
@@ -589,7 +572,6 @@ impl ChatToAnthropicStream {
                     self.text_open = false;
                     self.block_index += 1;
                 }
-                self.close_thinking(&mut events);
                 for call in calls {
                     let call_index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
                     if !self.calls.contains_key(&call_index) {
@@ -624,22 +606,8 @@ impl ChatToAnthropicStream {
         events
     }
 
-    /// Closes an open thinking block so another content block can start at
-    /// the next index; reasoning-only completions still close at `finish`.
-    fn close_thinking(&mut self, events: &mut Vec<SseEvent>) {
-        if self.thinking_open {
-            self.thinking_open = false;
-            events.push(SseEvent::json(
-                "content_block_stop",
-                &json!({"type":"content_block_stop","index":self.block_index}),
-            ));
-            self.block_index += 1;
-        }
-    }
-
     pub fn finish(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
-        self.close_thinking(&mut events);
         if self.text_open {
             events.push(SseEvent::json(
                 "content_block_stop",
@@ -883,15 +851,12 @@ mod tests {
     }
 
     #[test]
-    fn surfaces_reasoning_as_unsigned_thinking_without_fabricating_signatures() {
+    fn does_not_fabricate_anthropic_thinking_signatures() {
         let chat = json!({"choices":[{"finish_reason":"stop","message":{"reasoning_content":"r","content":"a"}}],"usage":{"prompt_tokens":2,"completion_tokens":3}});
         let message = chat_to_message(&chat, "public-anthropic-model");
         assert_eq!(message["model"], "public-anthropic-model");
-        assert_eq!(message["content"].as_array().unwrap().len(), 2);
-        assert_eq!(message["content"][0]["type"], "thinking");
-        assert_eq!(message["content"][0]["thinking"], "r");
-        assert!(message["content"][0].get("signature").is_none());
-        assert_eq!(message["content"][1]["type"], "text");
+        assert_eq!(message["content"].as_array().unwrap().len(), 1);
+        assert_eq!(message["content"][0]["type"], "text");
         assert!(!message.to_string().contains("quotamux"));
     }
 
@@ -915,15 +880,14 @@ mod tests {
         }));
         let started: Value = serde_json::from_str(&events[0].data).unwrap();
         assert_eq!(started["message"]["model"], "public-anthropic-model");
-        // Response streams surface upstream reasoning as thinking blocks so
-        // clients observe budget-consuming reasoning instead of emptiness;
-        // signatures stay absent because the upstream never provides one.
+        // Anthropic responses may only carry thinking blocks the client can
+        // replay with a signature, so upstream reasoning never becomes one.
         let serialized = events
             .iter()
             .map(|event| event.data.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(serialized.contains("thinking_delta"));
+        assert!(!serialized.contains("thinking"));
         assert!(!serialized.contains("signature"));
         assert!(serialized.contains("answer"));
     }
@@ -1090,81 +1054,5 @@ mod tests {
             finish[0]["usage"]["prompt_tokens_details"]["cached_tokens"],
             8
         );
-    }
-
-    fn payload(events: &[SseEvent]) -> Vec<Value> {
-        events
-            .iter()
-            .map(|event| serde_json::from_str(&event.data).unwrap())
-            .collect()
-    }
-
-    #[test]
-    fn chat_to_message_surfaces_reasoning_text_as_thinking() {
-        let chat = json!({
-            "choices":[{"finish_reason":"length","message":{
-                "content":"","reasoning_text":"内部独白"
-            }}],
-            "usage":{"prompt_tokens":10,"completion_tokens":8,"total_tokens":18}
-        });
-        let message = chat_to_message(&chat, "gemini-4-argon");
-        assert_eq!(message["content"][0]["type"], "thinking");
-        assert_eq!(message["content"][0]["thinking"], "内部独白");
-        assert_eq!(message["stop_reason"], "max_tokens");
-    }
-
-    #[test]
-    fn chat_to_anthropic_stream_maps_reasoning_deltas_to_thinking_blocks() {
-        let mut stream = ChatToAnthropicStream::new("gemini-4-argon");
-        let events = payload(&stream.translate(&json!({
-            "choices":[{"delta":{"reasoning_text":"think "}}]
-        })));
-        let events = &events[1..]; // skip message_start
-        assert_eq!(events[0]["type"], "content_block_start");
-        assert_eq!(events[0]["content_block"]["type"], "thinking");
-        assert_eq!(events[0]["index"], 0);
-        assert_eq!(events[1]["type"], "content_block_delta");
-        assert_eq!(events[1]["delta"]["type"], "thinking_delta");
-        assert_eq!(events[1]["delta"]["thinking"], "think ");
-
-        let events = payload(&stream.translate(&json!({
-            "choices":[{"delta":{"reasoning_text":"more"}},{"delta":{"content":"answer"}}]
-        })));
-        let kinds: Vec<&str> = events
-            .iter()
-            .map(|event| event["type"].as_str().unwrap_or(""))
-            .collect();
-        assert_eq!(
-            kinds,
-            vec![
-                "content_block_delta",
-                "content_block_stop",
-                "content_block_start",
-                "content_block_delta"
-            ]
-        );
-        assert_eq!(events[2]["index"], 1);
-        assert_eq!(events[2]["content_block"]["type"], "text");
-        let final_events = payload(&stream.finish());
-        assert_eq!(final_events[0]["type"], "content_block_stop");
-        assert_eq!(final_events[0]["index"], 1);
-    }
-
-    #[test]
-    fn reasoning_only_stream_closes_thinking_at_finish() {
-        // The empty-completion incident shape: reasoning consumes the whole
-        // budget, no content delta ever arrives.
-        let mut stream = ChatToAnthropicStream::new("gemini-4-argon");
-        stream.translate(&json!({"choices":[{"delta":{"reasoning_text":"all budget"}}]}));
-        let events = payload(&stream.finish());
-        let kinds: Vec<&str> = events
-            .iter()
-            .map(|event| event["type"].as_str().unwrap_or(""))
-            .collect();
-        assert_eq!(
-            kinds,
-            vec!["content_block_stop", "message_delta", "message_stop"]
-        );
-        assert_eq!(events[0]["index"], 0);
     }
 }
