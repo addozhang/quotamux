@@ -7,6 +7,10 @@ use crate::{sse::SseEvent, types::Usage};
 
 use super::{ValidationError, chat, set_model, validate_model};
 
+/// Smallest `max_output_tokens` the Responses API accepts. Anthropic and Chat
+/// clients legitimately send smaller budgets for probe and title requests.
+const MIN_OUTPUT_TOKENS: u64 = 16;
+
 pub fn prepare_direct(mut body: Value, upstream_model: &str) -> Result<Value, ValidationError> {
     validate_model(&body)?;
     set_model(&mut body, upstream_model);
@@ -109,7 +113,14 @@ pub fn prepare_from_chat(body: Value, upstream_model: &str) -> Result<Value, Val
         .get("max_completion_tokens")
         .or_else(|| chat.get("max_tokens"))
     {
-        response.insert("max_output_tokens".into(), value.clone());
+        // An Anthropic `max_tokens: 1` probe would otherwise reach the
+        // upstream as `max_output_tokens: 1`, which the Responses API rejects
+        // with a 400 that the client cannot act on. Clamp at the boundary.
+        let value = match value.as_u64() {
+            Some(tokens) if tokens < MIN_OUTPUT_TOKENS => json!(MIN_OUTPUT_TOKENS),
+            _ => value.clone(),
+        };
+        response.insert("max_output_tokens".into(), value);
     }
     for field in ["top_logprobs", "service_tier"] {
         copy_field(&chat, &mut response, field, field);
@@ -1109,6 +1120,25 @@ mod tests {
             chat["messages"][0]["tool_calls"][0]["function"]["name"],
             "update_plan"
         );
+    }
+
+    #[test]
+    fn translated_output_budget_meets_the_responses_minimum() {
+        let probe = json!({
+            "model":"upstream",
+            "messages":[{"role":"user","content":"hi"}],
+            "max_tokens":1
+        });
+        let prepared = prepare_from_chat(probe, "upstream").unwrap();
+        assert_eq!(prepared["max_output_tokens"], 16);
+
+        let normal = json!({
+            "model":"upstream",
+            "messages":[{"role":"user","content":"hi"}],
+            "max_completion_tokens":4096
+        });
+        let prepared = prepare_from_chat(normal, "upstream").unwrap();
+        assert_eq!(prepared["max_output_tokens"], 4096);
     }
 
     #[test]
