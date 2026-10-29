@@ -61,11 +61,35 @@ pub enum RouteDecision {
 
 pub struct CircuitProbeWait {
     changes: watch::Receiver<u64>,
+    /// When the circuit is merely cooling down, the moment it may be probed
+    /// again. `None` while a probe is already in flight.
+    retry_at_ms: Option<i64>,
 }
 
 impl CircuitProbeWait {
+    /// Resolves once the router should re-evaluate: the circuit state changed
+    /// or its next probe deadline arrived. `false` means the channel closed.
     pub async fn changed(mut self) -> bool {
-        self.changes.changed().await.is_ok()
+        let Some(at) = self.retry_at_ms else {
+            return self.changes.changed().await.is_ok();
+        };
+        let delay = (at - Utc::now().timestamp_millis()).max(0) as u64;
+        tokio::select! {
+            result = self.changes.changed() => result.is_ok(),
+            _ = tokio::time::sleep(Duration::from_millis(delay)) => true,
+        }
+    }
+
+    /// Whether this wait ends soon enough to be worth blocking a request for.
+    /// A circuit suspended for an hour must fail fast instead of parking a
+    /// caller for the whole probe budget.
+    pub fn is_within(&self, budget_ms: u64) -> bool {
+        self.retry_at_ms
+            .is_none_or(|at| at.saturating_sub(Utc::now().timestamp_millis()) <= budget_ms as i64)
+    }
+
+    pub const fn retry_at_ms(&self) -> Option<i64> {
+        self.retry_at_ms
     }
 }
 
@@ -215,14 +239,25 @@ impl CircuitBreaker {
                     },
                 }
             }
-            _ => RouteDecision::Fallback {
-                reason: state.reason,
-                probe_wait: (state.mode == CircuitMode::HalfOpen && state.probe_in_flight).then(
-                    || CircuitProbeWait {
-                        changes: self.changes.subscribe(),
-                    },
-                ),
-            },
+            _ => {
+                let probe_in_flight = state.mode == CircuitMode::HalfOpen && state.probe_in_flight;
+                let retry_at_ms = match state.mode {
+                    CircuitMode::Open | CircuitMode::Suspended => state.next_probe_at_ms,
+                    _ => None,
+                };
+                // A cooling circuit is worth waiting for: its backoff may be a
+                // single second, and failing the request outright turns that
+                // second into a client-visible 503.
+                RouteDecision::Fallback {
+                    reason: state.reason,
+                    probe_wait: (probe_in_flight || retry_at_ms.is_some()).then(|| {
+                        CircuitProbeWait {
+                            changes: self.changes.subscribe(),
+                            retry_at_ms: if probe_in_flight { None } else { retry_at_ms },
+                        }
+                    }),
+                }
+            }
         }
     }
 
@@ -454,6 +489,68 @@ mod tests {
         let second = circuit.snapshot().await;
         assert_eq!(second.backoff_level, 2);
         assert!(second.next_probe_at_ms.unwrap() - Utc::now().timestamp_millis() <= 2_100);
+    }
+
+    #[tokio::test]
+    async fn cooling_circuit_offers_a_waiter_instead_of_an_immediate_failure() {
+        let (_dir, circuit) = test_circuit().await;
+        primary(circuit.decide().await)
+            .failure(FailureClass::StreamFailure, None)
+            .await;
+        let snapshot = circuit.snapshot().await;
+        assert_eq!(snapshot.mode, CircuitMode::Open);
+        let ready_at = snapshot.next_probe_at_ms.unwrap();
+
+        match circuit.decide_at(ready_at - 200).await {
+            RouteDecision::Fallback {
+                probe_wait: Some(wait),
+                ..
+            } => {
+                assert_eq!(wait.retry_at_ms(), Some(ready_at));
+                assert!(wait.is_within(5_000));
+            }
+            _ => panic!("expected a cooling circuit to offer a wait"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cooling_waiter_wakes_at_its_deadline() {
+        let (_dir, circuit) = test_circuit().await;
+        primary(circuit.decide().await)
+            .failure(FailureClass::StreamFailure, None)
+            .await;
+        let ready_at = circuit.snapshot().await.next_probe_at_ms.unwrap();
+        let wait = match circuit.decide_at(ready_at - 200).await {
+            RouteDecision::Fallback {
+                probe_wait: Some(wait),
+                ..
+            } => wait,
+            _ => panic!("expected a cooling circuit to offer a wait"),
+        };
+
+        let started = std::time::Instant::now();
+        assert!(wait.changed().await);
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert!(Utc::now().timestamp_millis() >= ready_at);
+    }
+
+    #[tokio::test]
+    async fn suspended_circuit_reports_a_wait_outside_the_probe_budget() {
+        let (_dir, circuit) = test_circuit().await;
+        primary(circuit.decide().await)
+            .failure(FailureClass::ProviderAuth, None)
+            .await;
+        assert_eq!(circuit.snapshot().await.mode, CircuitMode::Suspended);
+
+        // An hour-long suspension must fail fast rather than park the caller
+        // for the whole probe budget.
+        match circuit.decide().await {
+            RouteDecision::Fallback {
+                probe_wait: Some(wait),
+                ..
+            } => assert!(!wait.is_within(5_000)),
+            _ => panic!("expected a suspended circuit to report its deadline"),
+        }
     }
 
     #[tokio::test]

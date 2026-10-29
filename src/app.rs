@@ -878,6 +878,7 @@ async fn handle_nonstream(
     let mut attempted = HashSet::new();
     let mut probe_wait_started = None;
     let mut probe_wait_timed_out = false;
+    let probe_budget_ms = state.config.server.timeouts.route_probe_wait_ms;
     'routing: loop {
         let mut probe_waiters = Vec::new();
         let mut evaluated = HashSet::new();
@@ -904,7 +905,9 @@ async fn handle_nonstream(
                 }
                 RouteDecision::Fallback { reason, probe_wait } => {
                     fallback_reason = fallback_reason.or(reason);
-                    if let Some(wait) = probe_wait {
+                    if let Some(wait) = probe_wait
+                        && wait.is_within(probe_budget_ms)
+                    {
                         probe_waiters.push(wait);
                     }
                     continue;
@@ -1320,6 +1323,7 @@ async fn handle_stream(
     let mut attempted = HashSet::new();
     let mut probe_wait_started = None;
     let mut probe_wait_timed_out = false;
+    let probe_budget_ms = state.config.server.timeouts.route_probe_wait_ms;
     'routing: loop {
         let mut probe_waiters = Vec::new();
         let mut evaluated = HashSet::new();
@@ -1350,7 +1354,9 @@ async fn handle_stream(
                 }
                 RouteDecision::Fallback { reason, probe_wait } => {
                     fallback_reason = fallback_reason.or(reason);
-                    if let Some(wait) = probe_wait {
+                    if let Some(wait) = probe_wait
+                        && wait.is_within(probe_budget_ms)
+                    {
                         probe_waiters.push(wait);
                     }
                     continue;

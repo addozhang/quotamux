@@ -593,12 +593,18 @@ and process startup releases any half-open state immediately. If all remaining
 routes are blocked by an in-flight probe, concurrent requests use one total
 `route_probe_wait_ms` budget. Each probe state change triggers another route
 evaluation, and the request keeps waiting within the remaining budget while an
-unattempted route still has a probe in flight. A concrete target is selected
-from the route graph at most once even if it appears in multiple layers (the
-documented ambiguous-rejection retry remains internal to that one selection). A
-timed-out synthetic `503` includes `Retry-After` rounded up from
-`route_probe_wait_ms` (five seconds by default) so callers do not immediately
-rejoin the same probe window.
+unattempted route still has a probe in flight.
+
+A circuit that is merely cooling down also reports its next probe deadline.
+When that deadline falls inside `route_probe_wait_ms`, the request waits for it
+instead of failing: a one-second transient backoff must not turn into a
+client-visible `503`. A suspension longer than the budget still fails
+immediately, so an hour-long auth backoff never parks a caller. A concrete
+target is selected from the route graph at most once even if it appears in
+multiple layers (the documented ambiguous-rejection retry remains internal to
+that one selection). A timed-out synthetic `503` includes `Retry-After` rounded
+up from `route_probe_wait_ms` (five seconds by default) so callers do not
+immediately rejoin the same probe window.
 
 Provider error bodies are inspected only for classification, with a 16 KiB
 limit. QuotaMux records and returns a controlled summary rather than copying

@@ -4915,6 +4915,90 @@ async fn opencode_go_usage_limit_error_is_quota_and_caps_retry_after() {
 }
 
 #[tokio::test]
+async fn a_cooling_circuit_waits_for_its_probe_instead_of_returning_503() {
+    let primary = MockProvider::start(vec![
+        MockReply::json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": {"message": "upstream exploded"}}),
+        ),
+        MockReply::json(StatusCode::OK, chat_completion("", "answer")),
+    ])
+    .await;
+
+    let config = Config {
+        capacity_pools: vec![],
+        config_version: 3,
+        server: ServerConfig {
+            listen: "127.0.0.1:0".into(),
+            data_dir: "unused-test-data".into(),
+            max_inference_body_bytes: DEFAULT_MAX_INFERENCE_BODY_BYTES,
+            timeouts: Default::default(),
+        },
+        affinity: Default::default(),
+        backends: vec![BackendConfig {
+            id: "opencode-go".into(),
+            adapter: AdapterKind::OpenCodeGo,
+            endpoint: Some(primary.endpoint()),
+            credentials: vec![CredentialConfig {
+                pool: None,
+                id: "go-plan".into(),
+                api_key: "test-opencode-key".into(),
+            }],
+            models: vec![BackendModelConfig {
+                name: UPSTREAM_MODEL.into(),
+                protocols: Vec::new(),
+                pricing: None,
+                ..Default::default()
+            }],
+        }],
+        models: vec![ServedModelConfig {
+            timezone: "UTC".into(),
+            schedules: vec![],
+            name: LOGICAL_MODEL.into(),
+            aliases: vec![UPSTREAM_MODEL.into()],
+            protocols: vec![Protocol::OpenAiChat],
+            layers: vec![RouteLayerConfig {
+                name: "only".into(),
+                strategy: RouteStrategy::Random,
+                targets: vec![RouteTargetConfig {
+                    backend: "opencode-go".into(),
+                    credential: "go-plan".into(),
+                    model: UPSTREAM_MODEL.into(),
+                }],
+            }],
+        }],
+    };
+    let gateway = Gateway::start_config(config, 0x5eed).await;
+    let client = reqwest::Client::new();
+    let body = json!({"model":LOGICAL_MODEL,"messages":[{"role":"user","content":"hello"}]});
+
+    let first = client
+        .post(gateway.url("/v1/chat/completions"))
+        .json(&body)
+        .send()
+        .await
+        .expect("first response");
+    assert_ne!(first.status(), StatusCode::OK);
+
+    // The circuit now cools for a single second. A request arriving inside that
+    // window waits for the probe instead of surfacing "no route target".
+    let started = std::time::Instant::now();
+    let second = client
+        .post(gateway.url("/v1/chat/completions"))
+        .json(&body)
+        .send()
+        .await
+        .expect("second response");
+    assert_eq!(second.status(), StatusCode::OK);
+    assert!(
+        started.elapsed() >= Duration::from_millis(500),
+        "the request should have waited for the probe, took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(primary.calls().await, 2);
+}
+
+#[tokio::test]
 async fn unused_later_layer_does_not_claim_a_half_open_probe() {
     let primary = MockProvider::start(vec![
         MockReply::json(
