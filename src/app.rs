@@ -1027,7 +1027,11 @@ async fn handle_nonstream(
         &request_id,
         &served_model.name,
         &usage,
-        &outcome.raw_upstream.to_string(),
+        &format!(
+            "shape[{}] raw={}",
+            chat_request_shape(&body),
+            outcome.raw_upstream
+        ),
     );
     let record = RequestRecord {
         id: request_id.clone(),
@@ -1514,6 +1518,7 @@ async fn handle_stream(
         // chat completions.
         let mut upstream_tail: VecDeque<String> = VecDeque::with_capacity(STREAM_TAIL_EVENTS);
         let mut finish_reason: Option<String> = None;
+        let (mut data_events, mut content_deltas, mut reasoning_deltas) = (0_u32, 0_u32, 0_u32);
         let mut response_translator =
             responses::ChatToResponsesStream::new(requested_model.clone(), body.clone());
         let mut anthropic_translator =
@@ -1558,6 +1563,24 @@ async fn handle_stream(
                     upstream_tail.push_back(truncate_for_log(&event.data, STREAM_TAIL_EVENT_BYTES));
                     while upstream_tail.len() > STREAM_TAIL_EVENTS {
                         upstream_tail.pop_front();
+                    }
+                    data_events += 1;
+                    if let Ok(parsed) = serde_json::from_str::<Value>(&event.data)
+                        && let Some(choices) = parsed.get("choices").and_then(Value::as_array)
+                    {
+                        for choice in choices {
+                            let Some(delta) = choice.get("delta") else { continue };
+                            if delta
+                                .get("content")
+                                .and_then(Value::as_str)
+                                .is_some_and(|text| !text.is_empty())
+                            {
+                                content_deltas += 1;
+                            }
+                            if chat_delta_reasoning_chars(delta) > 0 {
+                                reasoning_deltas += 1;
+                            }
+                        }
                     }
                     if translated {
                         match serde_json::from_str::<Value>(&event.data) {
@@ -1658,7 +1681,9 @@ async fn handle_stream(
                 &configured_model,
                 &usage,
                 &format!(
-                    "finish_reason={finish_reason:?} tail={}",
+                    "finish_reason={finish_reason:?} events={data_events} content_deltas={content_deltas} \
+                     reasoning_deltas={reasoning_deltas} shape[{}] tail={}",
+                    chat_request_shape(&body),
                     upstream_tail.iter().cloned().collect::<Vec<_>>().join(" | ")
                 ),
             );
@@ -2378,12 +2403,70 @@ fn completed_usage(protocol: Protocol, value: &Value) -> Usage {
 /// the attempt ledger only records metadata, so log the upstream evidence
 /// whenever a successful completion stays under this many output tokens.
 const EMPTY_COMPLETION_OUTPUT_TOKENS: u64 = 64;
-const EMPTY_COMPLETION_EVIDENCE_BYTES: usize = 2048;
+const EMPTY_COMPLETION_EVIDENCE_BYTES: usize = 8192;
 const STREAM_TAIL_EVENTS: usize = 8;
 const STREAM_TAIL_EVENT_BYTES: usize = 512;
 
 fn is_likely_empty_completion(usage: &Usage) -> bool {
     usage.output_tokens < EMPTY_COMPLETION_OUTPUT_TOKENS
+}
+
+/// Counts reasoning payload carried by a chat-completions stream delta.
+/// Gemini on Copilot streams reasoning as `reasoning_text` deltas and/or an
+/// opaque `reasoning_opaque` handle; DeepSeek-style `reasoning_content` is
+/// counted too so translated traffic is covered.
+fn chat_delta_reasoning_chars(delta: &Value) -> usize {
+    ["reasoning_text", "reasoning_content", "reasoning_opaque"]
+        .iter()
+        .filter_map(|key| delta.get(*key))
+        .filter_map(Value::as_str)
+        .map(str::chars)
+        .map(Iterator::count)
+        .sum()
+}
+
+/// Structural summary of an egress chat body used when diagnosing empty
+/// completions: enough to correlate failures with conversation shape while
+/// never logging message content.
+fn chat_request_shape(body: &Value) -> String {
+    let messages = body.get("messages").and_then(Value::as_array);
+    let total = messages.map_or(0, Vec::len);
+    let (mut assistant, mut assistant_reasoning, mut assistant_null, mut tool_calls) =
+        (0_u32, 0_u32, 0_u32, 0_u32);
+    for message in messages.into_iter().flatten() {
+        if message.get("role").and_then(Value::as_str) == Some("assistant") {
+            assistant += 1;
+            let carries_reasoning = [
+                "reasoning_content",
+                "reasoning_text",
+                "reasoning_opaque",
+                "encrypted_content",
+            ]
+            .iter()
+            .any(|key| {
+                message
+                    .get(*key)
+                    .is_some_and(|value| !value.is_null() && value != "")
+            });
+            if carries_reasoning {
+                assistant_reasoning += 1;
+            }
+            let empty_content = message
+                .get("content")
+                .is_none_or(|value| value.is_null() || value.as_str() == Some(""));
+            if empty_content {
+                assistant_null += 1;
+            }
+        }
+        tool_calls += message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .map_or(0_u32, |calls| calls.len() as u32);
+    }
+    format!(
+        "messages={total} assistant={assistant} assistant_reasoning={assistant_reasoning} \
+         assistant_null_content={assistant_null} tool_calls={tool_calls}"
+    )
 }
 
 fn truncate_for_log(value: &str, limit: usize) -> String {
@@ -3102,6 +3185,40 @@ mod tests {
         let text = "你好世界".repeat(100);
         let cut = truncate_for_log(&text, 10);
         assert_eq!(cut.chars().count(), 10);
+    }
+
+    #[test]
+    fn request_shape_counts_assistant_reasoning_without_logging_content() {
+        let body = json!({
+            "model":"gemini-4-argon",
+            "messages":[
+                {"role":"user","content":"question"},
+                {"role":"assistant","content":null,"reasoning_content":"private thoughts"},
+                {"role":"assistant","content":"answer","tool_calls":[{"id":"t","type":"function","function":{"name":"f","arguments":"{}"}}]},
+                {"role":"assistant","content":null,"reasoning_opaque":"opaque-handle"},
+                {"role":"user","content":"follow-up"}
+            ]
+        });
+        let shape = chat_request_shape(&body);
+        assert!(shape.contains("messages=5"), "{shape}");
+        assert!(shape.contains("assistant=3"), "{shape}");
+        assert!(shape.contains("assistant_reasoning=2"), "{shape}");
+        assert!(shape.contains("assistant_null_content=2"), "{shape}");
+        assert!(shape.contains("tool_calls=1"), "{shape}");
+        assert!(!shape.contains("private thoughts"));
+    }
+
+    #[test]
+    fn reasoning_chars_cover_copilot_and_deepseek_delta_spellings() {
+        assert_eq!(
+            chat_delta_reasoning_chars(&json!({"reasoning_text":"abc"})),
+            3
+        );
+        assert_eq!(
+            chat_delta_reasoning_chars(&json!({"reasoning_opaque":"opaque"})),
+            6
+        );
+        assert_eq!(chat_delta_reasoning_chars(&json!({"content":"answer"})), 0);
     }
 
     #[test]
