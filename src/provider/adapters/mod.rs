@@ -55,6 +55,15 @@ pub trait ProviderAdapter: Send + Sync {
         None
     }
 
+    /// Whether outbound request bodies above the compression threshold are
+    /// sent `Content-Encoding: gzip`. Enabled for endpoints whose edge
+    /// enforces a request-body read window that large agent payloads can
+    /// outgrow (observed: GitHub Copilot 408 `user_request_timeout` at
+    /// ~1.9 MB).
+    fn compresses_request_bodies(&self) -> bool {
+        false
+    }
+
     fn model_protocol_policy(&self) -> ModelProtocolPolicy {
         ModelProtocolPolicy::Listed
     }
