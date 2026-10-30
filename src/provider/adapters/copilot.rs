@@ -65,15 +65,6 @@ impl ProviderAdapter for Copilot {
         Some(ThinkingStyle::EffortLevels)
     }
 
-    fn compresses_request_bodies(&self) -> bool {
-        // GitHub's edge enforces a request-body read window (~60s); at
-        // typical uplink speeds bodies beyond ~1.9 MB die with 408
-        // `user_request_timeout` before reaching the model. The API accepts
-        // gzipped request bodies, shrinking agent-sized payloads enough to
-        // fit comfortably inside the window.
-        true
-    }
-
     fn classify_error(&self, status: StatusCode, details: &ErrorDetails) -> FailureClass {
         // GitHub's edge intermittently rejects bursty traffic with a
         // plain-text 403 citing the Terms of Service. That is throttling,

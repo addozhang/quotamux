@@ -67,10 +67,6 @@ pub struct BackendError {
     pub upstream_message: Option<String>,
 }
 
-/// Bodies at or above this size are gzip-compressed on egress when the
-/// adapter enables request compression.
-const REQUEST_GZIP_MIN_BYTES: usize = 16 * 1024;
-
 impl BackendError {
     /// Builds an error with no retained upstream envelope detail.
     pub fn local(
@@ -314,38 +310,7 @@ impl BackendClient {
         } else {
             &self.client
         };
-        let mut request = if self.adapter.compresses_request_bodies()
-            && let Ok(raw) = serde_json::to_vec(body)
-            && raw.len() >= REQUEST_GZIP_MIN_BYTES
-        {
-            // Verified against api.githubcopilot.com: gzip-encoded JSON
-            // bodies are accepted and cut upload time dramatically on
-            // large agent contexts.
-            use std::io::Write as _;
-            let compress = |raw: &[u8]| {
-                let mut encoder =
-                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-                encoder
-                    .write_all(raw)
-                    .and_then(|_| encoder.finish())
-                    .map_err(|_| {
-                        BackendError::local(
-                            FailureClass::ProviderUnknown5xxOrTransport,
-                            None,
-                            None,
-                            "failed to compress request body",
-                        )
-                    })
-            };
-            let compressed = compress(&raw)?;
-            client
-                .post(url)
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .header("Content-Encoding", "gzip")
-                .body(compressed)
-        } else {
-            client.post(url).json(body)
-        };
+        let mut request = client.post(url).json(body);
         request = self
             .adapter
             .apply_auth(request, &self.api_key, protocol, inbound_headers);
@@ -1216,11 +1181,4 @@ mod tests {
         server.abort();
         assert_eq!(body.len(), MAX_ERROR_BYTES);
     }
-}
-#[test]
-fn only_compressing_adapters_mark_request_compression() {
-    let copilot = crate::provider::adapter_for(AdapterKind::Copilot).unwrap();
-    assert!(copilot.compresses_request_bodies());
-    let zhipu = crate::provider::adapter_for(AdapterKind::ZhipuCodingPlan).unwrap();
-    assert!(!zhipu.compresses_request_bodies());
 }
