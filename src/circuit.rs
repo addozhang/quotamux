@@ -412,7 +412,7 @@ fn schedule_for(class: FailureClass) -> &'static [Duration] {
     const QUOTA: &[Duration] = &[
         Duration::from_secs(60),
         Duration::from_secs(300),
-        Duration::from_secs(900),
+        Duration::from_secs(300),
     ];
     const BILLING: &[Duration] = &[Duration::from_secs(3600)];
     match class {
@@ -720,7 +720,7 @@ mod tests {
         );
         assert_eq!(
             retry_delay(FailureClass::ProviderQuota, 0, huge),
-            Duration::from_secs(900)
+            Duration::from_secs(300)
         );
         assert_eq!(
             retry_delay(FailureClass::ProviderAuth, 0, huge),
